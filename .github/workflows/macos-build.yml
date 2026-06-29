@@ -96,6 +96,14 @@ jobs:
         run: |
           APP="$RUNNER_TEMP/build/Debug/BDropUploader.app"
           if [ -d "$APP" ]; then
+            # ffmpeg/ffprobe zuverlaessig ins Bundle legen (XcodeGen-Resource-Copy
+            # greift bei den Binaries nicht). FFmpegLocator sucht hier zuerst.
+            if [ -x Resources/ffmpeg/ffmpeg ]; then
+              mkdir -p "$APP/Contents/Resources/ffmpeg"
+              cp Resources/ffmpeg/ffmpeg Resources/ffmpeg/ffprobe "$APP/Contents/Resources/ffmpeg/" 2>/dev/null || true
+              chmod +x "$APP/Contents/Resources/ffmpeg/ffmpeg" "$APP/Contents/Resources/ffmpeg/ffprobe" 2>/dev/null || true
+              echo "ffmpeg/ffprobe ins Bundle kopiert."
+            fi
             ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/BDropUploader.app.zip"
             echo "App gepackt: $APP"
           else
