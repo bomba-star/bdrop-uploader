@@ -10,6 +10,8 @@ import SwiftUI
 struct ContentView: View {
     @Environment(QueueStore.self) private var queue
     @Environment(TokenStore.self) private var tokens
+    // FIX C: Offizielles Settings-Environment statt fragiler interner Selektor-API.
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(spacing: 0) {
@@ -74,8 +76,7 @@ struct ContentView: View {
             }
             Spacer()
             Button("Einstellungen öffnen") {
-                // Oeffnet das Standard-Settings-Fenster.
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                openSettings()
             }
         }
         .padding()

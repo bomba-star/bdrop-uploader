@@ -354,14 +354,29 @@ final class QueueStore {
     }
 
     /// Loest den gespeicherten Export-Ordner (security-scoped Bookmark) auf.
+    /// FIX D: Veraltetes Bookmark wird erneuert und in UserDefaults gesichert.
     private func resolveExportDirectory() -> URL? {
         guard let data = UserDefaults.standard.data(forKey: Self.exportDirKey) else { return nil }
         var stale = false
-        return try? URL(
+        guard let url = try? URL(
             resolvingBookmarkData: data,
             options: [.withSecurityScope],
             relativeTo: nil,
-            bookmarkDataIsStale: &stale)
+            bookmarkDataIsStale: &stale) else {
+            return nil
+        }
+        // Veraltetes Bookmark erneuern: kurz Zugriff oeffnen, neues Bookmark schreiben.
+        if stale {
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+            if let fresh = try? url.bookmarkData(
+                options: [.withSecurityScope],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil) {
+                UserDefaults.standard.set(fresh, forKey: Self.exportDirKey)
+            }
+        }
+        return url
     }
 
     /// Setzt den Export-Ordner aus einer vom Nutzer gewaehlten URL (Settings).
@@ -661,6 +676,7 @@ final class QueueStore {
 
     /// Loest ein Security-Scoped Bookmark auf und startet den Zugriff.
     /// Der Aufrufer MUSS stopAccessingSecurityScopedResource() aufrufen.
+    /// FIX D: Veraltete Bookmarks werden automatisch erneuert (Datei umgezogen/umbenannt).
     private func resolveBookmark(for item: QueueItem) -> URL? {
         guard let data = item.sourceBookmark else { return nil }
         var isStale = false
@@ -672,6 +688,15 @@ final class QueueStore {
             return nil
         }
         guard url.startAccessingSecurityScopedResource() else { return nil }
+        // Veraltetes Bookmark erneuern (Zugriff ist bereits geoeffnet).
+        if isStale,
+           let fresh = try? url.bookmarkData(
+               options: [.withSecurityScope],
+               includingResourceValuesForKeys: nil,
+               relativeTo: nil) {
+            item.sourceBookmark = fresh
+            save()
+        }
         return url
     }
 

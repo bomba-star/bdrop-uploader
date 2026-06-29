@@ -5,6 +5,9 @@
 // Spiegelt die Backend-Struktur (Projekt-Picker + verschachtelter Ordnerbaum).
 //
 // Hinweis: Auf einem Linux-VPS geschrieben, auf dem Mac noch nicht gebaut.
+//
+// FIX A: Lokale @State-Kopien statt direktem @Bindable-Schreiben. Aenderungen
+// werden erst beim "Fertig"-Tap zurueckgeschrieben - Escape/Abbrechen verwirft.
 
 import SwiftUI
 
@@ -12,21 +15,45 @@ struct ItemEditorView: View {
     @Environment(QueueStore.self) private var queue
     @Environment(TokenStore.self) private var tokens
     @Environment(\.dismiss) private var dismiss
+
+    // item dient nur als Datenquelle beim Initialisieren und als Schreibziel beim
+    // "Fertig"-Tap. Keine Bindings (kein $item) - das verhindert Live-Commits.
     @Bindable var item: QueueItem
+
+    // Lokale Edit-Kopien - spiegeln item-Felder beim Oeffnen, werden nur bei
+    // "Fertig" zurueckgeschrieben.
+    @State private var editTitle = ""
+    @State private var editTarget: UploadTarget = .cfStream
+    @State private var editQuality: EncodeQuality = .reviewFast
+    @State private var editProjectId: String?
+    @State private var editFolderId: String?
+    @State private var editNewVersionId: String?
+    @State private var uploadAsNewVersion = false
 
     @State private var projects: [ProjectDTO] = []
     @State private var folders: [FolderDTO] = []
     @State private var videos: [VideoSummaryDTO] = []
-    @State private var uploadAsNewVersion = false
     @State private var loadError: String?
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
+                Button("Abbrechen") {
+                    // Kein Zurueckschreiben - alle Aenderungen verwerfen.
+                    dismiss()
+                }
+                Spacer()
                 Text("Job bearbeiten")
                     .font(.headline)
                 Spacer()
                 Button("Fertig") {
+                    // Alle edit-States zurueck ins @Model schreiben.
+                    item.displayName = editTitle.isEmpty ? item.displayName : editTitle
+                    item.target = editTarget
+                    item.quality = editQuality
+                    item.projectId = editProjectId
+                    item.folderId = editFolderId
+                    item.newVersionOfVideoId = uploadAsNewVersion ? editNewVersionId : nil
                     queue.persistEdits()
                     dismiss()
                 }
@@ -38,20 +65,20 @@ struct ItemEditorView: View {
 
             Form {
                 Section("Allgemein") {
-                    TextField("Titel", text: $item.displayName)
-                    Picker("Ziel", selection: $item.target) {
+                    TextField("Titel", text: $editTitle)
+                    Picker("Ziel", selection: $editTarget) {
                         ForEach(UploadTarget.allCases, id: \.self) { t in
                             Text(t.germanLabel).tag(t)
                         }
                     }
-                    Picker("Qualität", selection: $item.quality) {
+                    Picker("Qualität", selection: $editQuality) {
                         ForEach(EncodeQuality.allCases, id: \.self) { q in
                             Text(q.germanLabel).tag(q)
                         }
                     }
                 }
 
-                if item.target.isLocal {
+                if editTarget.isLocal {
                     Section {
                         Text("Lokaler Export: wird in den Export-Ordner gespeichert, kein Upload, keine Projekt-/Ordner-Auswahl nötig.")
                             .font(.caption)
@@ -60,11 +87,12 @@ struct ItemEditorView: View {
                 } else {
                     Section("Ziel auf dem Server") {
                         Picker("Projekt", selection: Binding(
-                            get: { item.projectId ?? "" },
+                            get: { editProjectId ?? "" },
                             set: { newValue in
-                                item.projectId = newValue.isEmpty ? nil : newValue
-                                item.folderId = nil
-                                item.newVersionOfVideoId = nil
+                                editProjectId = newValue.isEmpty ? nil : newValue
+                                editFolderId = nil
+                                editNewVersionId = nil
+                                uploadAsNewVersion = false
                                 Task { await loadFolders(); await loadVideos() }
                             })) {
                             Text("Bitte wählen").tag("")
@@ -76,17 +104,17 @@ struct ItemEditorView: View {
                                 .foregroundStyle(.secondary)
                             FolderTreePicker(
                                 nodes: FolderNode.buildTree(from: folders),
-                                selection: $item.folderId)
+                                selection: $editFolderId)
                         }
                     }
 
                     Section("Version") {
                         Toggle("Als neue Version eines bestehenden Videos hochladen", isOn: $uploadAsNewVersion)
-                            .disabled(item.projectId == nil)
+                            .disabled(editProjectId == nil)
                         if uploadAsNewVersion {
                             Picker("Bestehendes Video", selection: Binding(
-                                get: { item.newVersionOfVideoId ?? "" },
-                                set: { item.newVersionOfVideoId = $0.isEmpty ? nil : $0 })) {
+                                get: { editNewVersionId ?? "" },
+                                set: { editNewVersionId = $0.isEmpty ? nil : $0 })) {
                                 Text("Bitte wählen").tag("")
                                 ForEach(videos) { v in Text(v.title).tag(v.id) }
                             }
@@ -107,9 +135,16 @@ struct ItemEditorView: View {
         }
         .frame(width: 480, height: 540)
         .onChange(of: uploadAsNewVersion) { _, isOn in
-            if !isOn { item.newVersionOfVideoId = nil }
+            if !isOn { editNewVersionId = nil }
         }
         .task {
+            // Zuerst alle edit-States aus item initialisieren, dann erst laden.
+            editTitle = item.displayName
+            editTarget = item.target
+            editQuality = item.quality
+            editProjectId = item.projectId
+            editFolderId = item.folderId
+            editNewVersionId = item.newVersionOfVideoId
             uploadAsNewVersion = item.newVersionOfVideoId != nil
             await loadProjects()
             await loadFolders()
@@ -129,12 +164,15 @@ struct ItemEditorView: View {
     }
 
     private func loadFolders() async {
-        guard let pid = item.projectId, tokens.hasAdminToken else { folders = []; return }
+        // Nutzt editProjectId (nicht item.projectId) - Projekt-Aenderung im Editor
+        // soll sofort die passenden Ordner laden.
+        guard let pid = editProjectId, tokens.hasAdminToken else { folders = []; return }
         folders = (try? await ApiClient(tokenStore: tokens).listFolders(projectID: pid)) ?? []
     }
 
     private func loadVideos() async {
-        guard let pid = item.projectId, tokens.hasAdminToken else { videos = []; return }
+        // Nutzt editProjectId (nicht item.projectId) - analog zu loadFolders.
+        guard let pid = editProjectId, tokens.hasAdminToken else { videos = []; return }
         videos = (try? await ApiClient(tokenStore: tokens).listVideos(projectID: pid)) ?? []
     }
 }

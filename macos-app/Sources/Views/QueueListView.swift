@@ -26,12 +26,15 @@ struct QueueRowView: View {
     @Environment(QueueStore.self) private var queue
     let item: QueueItem
     @State private var editingItem: QueueItem?
+    // FIX B: Thumbnail einmal gecacht statt bei jedem Render von Disk gelesen.
+    // Asynchrones Laden verhindert Main-Thread-Blockierung bei Progress-Updates.
+    @State private var thumbnail: NSImage?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
-                if let tp = item.thumbnailPath, let img = NSImage(contentsOfFile: tp) {
-                    Image(nsImage: img)
+                if let thumbnail {
+                    Image(nsImage: thumbnail)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: 48, height: 27)
@@ -69,6 +72,18 @@ struct QueueRowView: View {
         .padding(.vertical, 4)
         .sheet(item: $editingItem) { editItem in
             ItemEditorView(item: editItem)
+        }
+        .task(id: item.thumbnailPath) {
+            // Thumbnail-Pfad aendern -> neu laden. NSImage ist nicht Sendable,
+            // daher Bilddaten (Data, Sendable) in detached Task lesen und
+            // NSImage erst auf dem MainActor erzeugen.
+            guard let path = item.thumbnailPath else { thumbnail = nil; return }
+            let data = await Task.detached { try? Data(contentsOf: URL(fileURLWithPath: path)) }.value
+            if let data {
+                thumbnail = NSImage(data: data)
+            } else {
+                thumbnail = nil
+            }
         }
     }
 
