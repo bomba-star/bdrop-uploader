@@ -52,6 +52,7 @@ struct BDropUploaderApp: App {
                 .environment(tokenStore)
                 .frame(minWidth: 720, minHeight: 480)
                 .task {
+                    await NotificationService.shared.requestAuthorization()
                     // Crash-Recovery einmalig beim Start (PLAN.md Abschnitt 8).
                     await queueStore.performCrashRecovery()
                 }
@@ -70,10 +71,11 @@ struct BDropUploaderApp: App {
                 .environment(tokenStore)
         }
 
-        // TODO(optional): MenuBarExtra fuer schnellen Queue-Status ohne Hauptfenster.
-        // MenuBarExtra("B-Drop", systemImage: "arrow.up.circle") {
-        //     MenuBarContentView().environment(queueStore)
-        // }
-        // .menuBarExtraStyle(.window)
+        // Menueleisten-Extra fuer schnellen Queue-Status ohne Hauptfenster.
+        MenuBarExtra("B-Drop", systemImage: "arrow.up.circle") {
+            MenuBarContentView()
+                .environment(queueStore)
+        }
+        .menuBarExtraStyle(.window)
     }
 }

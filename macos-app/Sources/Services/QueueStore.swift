@@ -116,6 +116,13 @@ final class QueueStore {
         save(); reload()
     }
 
+    /// Postet eine macOS-Benachrichtigung fuer ein terminales Item (fertig/Fehler).
+    private func notifyTerminal(_ item: QueueItem, success: Bool) {
+        NotificationService.shared.notify(
+            title: success ? "Fertig: \(item.displayName)" : "Fehlgeschlagen: \(item.displayName)",
+            body: success ? "Bereit." : (item.lastError ?? "Unbekannter Fehler"))
+    }
+
     // MARK: - Drop -> neues Item (PLAN.md Abschnitt 11, Schritt 1)
 
     /// Erzeugt ein QueueItem aus einer gedroppten Datei-URL.
@@ -316,8 +323,10 @@ final class QueueStore {
             item.outputPath = target.path
             item.status = .done
             item.setProgress(1)
+            notifyTerminal(item, success: true)
         } catch {
             item.markFailed("Export fehlgeschlagen: \(error.localizedDescription)")
+            notifyTerminal(item, success: false)
         }
     }
 
@@ -427,8 +436,10 @@ final class QueueStore {
             if let path = item.outputPath {
                 try? FileManager.default.removeItem(atPath: path)
             }
+            notifyTerminal(item, success: true)
         } else {
             item.markFailed("Cloudflare meldet einen Verarbeitungsfehler. Retry legt eine neue Version an.")
+            notifyTerminal(item, success: false)
         }
         save(); reload()
     }
@@ -543,6 +554,7 @@ final class QueueStore {
         } else {
             item.markFailed(error.localizedDescription)
         }
+        if item.status == .failed { notifyTerminal(item, success: false) }
         save(); reload()
     }
 
