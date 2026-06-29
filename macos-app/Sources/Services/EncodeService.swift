@@ -1,0 +1,308 @@
+// EncodeService.swift
+//
+// Baut den ffmpeg-Befehl gemaess PLAN.md Abschnitt 5 und startet ffmpeg via Process.
+// Parst `-progress pipe:1 -nostats` (out_time_us gegen die geprobte Dauer -> Prozent).
+// Ein serieller Encode-Slot (vom QueueStore erzwungen). SIGSTOP/SIGCONT-Pause optional.
+// Setzt PLAN.md Abschnitt 5 (ffmpeg-Templates), Abschnitt 8 (ein Slot) und 10 (EncodeService) um.
+//
+// Hinweis: Auf einem Linux-VPS geschrieben, auf dem Mac noch nicht gebaut.
+
+import Foundation
+
+/// Resultat eines Encode-Laufs.
+struct EncodeOutput: Sendable {
+    /// Pfad der erzeugten Datei im Scratch.
+    var outputURL: URL
+    /// Der tatsaechlich angewandte Plan (kann durch VideoToolbox-Fallback abweichen).
+    var appliedSettings: EncodeSettings
+}
+
+enum EncodeError: LocalizedError {
+    case binaryNotFound
+    case nonZeroExit(code: Int32, stderrTail: String)
+    case cancelled
+    case scratchUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .binaryNotFound:
+            return "ffmpeg wurde nicht gefunden (weder im Bundle noch unter /opt/homebrew/bin)."
+        case .nonZeroExit(let code, let tail):
+            return "ffmpeg endete mit Code \(code): \(tail)"
+        case .cancelled:
+            return "Encode wurde abgebrochen."
+        case .scratchUnavailable:
+            return "Der Scratch-Ordner konnte nicht angelegt werden."
+        }
+    }
+}
+
+/// Encodiert eine Quelle in einen CF-tauglichen H.264-Master (Ziel A).
+///
+/// Der Aufrufer (QueueStore) garantiert die Serialitaet (genau ein aktiver Slot).
+/// Diese Klasse ist ein Aktor, damit der laufende Process-Handle threadsicher
+/// gestoppt/fortgesetzt/abgebrochen werden kann.
+actor EncodeService {
+
+    private var currentProcess: Process?
+
+    // MARK: - Plan-Auswahl
+
+    /// Leitet aus dem Probe-Ergebnis und der Nutzer-Wunschqualitaet den Encode-Plan ab.
+    /// (PLAN.md Abschnitt 5: smart statt stur)
+    static func plan(for probe: ProbeResult, quality: EncodeQuality) -> EncodeSettings {
+        let compatible: Bool = {
+            if case .compatible = probe.classification { return true }
+            return false
+        }()
+        // Smart-Remux nur, wenn die Quelle tauglich ist UND die Stufe keine
+        // Skalierung verlangt (z.B. 4K-Master). Sonst echter Encode mit Cap.
+        if compatible && quality.allowRemux {
+            let tag = probe.codec == "hevc" ? "hvc1" : "avc1"
+            return EncodeSettings(plan: .smartRemux, quality: quality, sourceWasCompatible: true, videoTag: tag)
+        }
+        let plan: EncodePlan = quality.usesHardware ? .hardwareH264 : .softwareX264
+        return EncodeSettings(plan: plan, quality: quality, sourceWasCompatible: compatible, videoTag: "avc1")
+    }
+
+    /// Liefert das -vf-Scale-Argument fuer die Aufloesungs-Obergrenze der Stufe.
+    /// Skaliert nur herunter (min(maxW,iw)), nie hoch. Leer, wenn keine Grenze.
+    private static func scaleArgs(for quality: EncodeQuality) -> [String] {
+        guard let w = quality.maxWidth else { return [] }
+        return ["-vf", "scale='min(\(w),iw)':-2:flags=lanczos"]
+    }
+
+    // MARK: - ffmpeg-Argumente (PLAN.md Abschnitt 5)
+
+    /// Baut die ffmpeg-Argumentliste fuer den gegebenen Plan.
+    static func arguments(input: URL, output: URL, settings: EncodeSettings) -> [String] {
+        // Gemeinsame Progress-Flags. -progress auf stdout, -nostats unterdrueckt das
+        // normale stderr-Geplapper. -y ueberschreibt den (von uns kontrollierten) Output.
+        let progress = ["-progress", "pipe:1", "-nostats", "-y"]
+
+        switch settings.plan {
+        case .smartRemux:
+            // Schneller Faststart-Remux ohne Generationsverlust (PLAN.md Abschnitt 5).
+            return ["-i", input.path]
+                + ["-c", "copy", "-movflags", "+faststart"]
+                + ["-tag:v", settings.videoTag]
+                + progress
+                + [output.path]
+
+        case .hardwareH264:
+            // Review-Master, Hardware, akkuschonend. Optionaler Aufloesungs-Cap.
+            return ["-i", input.path]
+                + scaleArgs(for: settings.quality)
+                + ["-c:v", "h264_videotoolbox", "-profile:v", "high",
+                   "-q:v", "\(AppConfig.videotoolboxQuality)", "-pix_fmt", "yuv420p",
+                   "-tag:v", "avc1",
+                   "-c:a", "aac", "-b:a", AppConfig.audioBitrate,
+                   "-movflags", "+faststart"]
+                + progress
+                + [output.path]
+
+        case .softwareX264:
+            // Software, maximale Qualitaet pro Bit. Optionaler Aufloesungs-Cap.
+            return ["-i", input.path]
+                + scaleArgs(for: settings.quality)
+                + ["-c:v", "libx264", "-preset", "slow", "-crf", "\(AppConfig.x264CRF)",
+                   "-pix_fmt", "yuv420p",
+                   "-tag:v", "avc1",
+                   "-c:a", "aac", "-b:a", AppConfig.audioBitrate,
+                   "-movflags", "+faststart"]
+                + progress
+                + [output.path]
+
+        case .hlsLadder:
+            // TODO(Ziel B): aspektgenaue HLS-Ladder gemaess PLAN.md Abschnitt 6.
+            // Noch nicht implementiert. Siehe HLSLadderBuilder.swift (Platzhalter).
+            return []
+        }
+    }
+
+    // MARK: - Ausfuehrung mit Live-Progress
+
+    /// Fuehrt den Encode aus. `onProgress` liefert 0.0..1.0 (auf Basis der geprobten Dauer).
+    /// Wirft EncodeError bei Nicht-Null-Exit, mit automatischem libx264-Fallback,
+    /// wenn h264_videotoolbox scheitert (PLAN.md Abschnitt 9: VideoToolbox-Fehler).
+    func encode(
+        input: URL,
+        scratchDir: URL,
+        itemID: UUID,
+        durationSeconds: Double,
+        settings: EncodeSettings,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws -> EncodeOutput {
+
+        try FileManager.default.createDirectory(at: scratchDir, withIntermediateDirectories: true)
+
+        let output = scratchDir.appendingPathComponent("\(itemID.uuidString).mp4")
+        // Vorherigen Teil-Output verwerfen (ffmpeg ist nicht frame-resumierbar).
+        try? FileManager.default.removeItem(at: output)
+
+        do {
+            try await runFFmpegArgs(Self.arguments(input: input, output: output, settings: settings), durationSeconds: durationSeconds, onProgress: onProgress)
+            return EncodeOutput(outputURL: output, appliedSettings: settings)
+        } catch EncodeError.nonZeroExit(let code, let tail) where settings.plan == .hardwareH264 {
+            // VideoToolbox-Fehler (exotisches Pixelformat) -> Fallback auf libx264.
+            var fallback = settings
+            fallback.plan = .softwareX264
+            try? FileManager.default.removeItem(at: output)
+            do {
+                try await runFFmpegArgs(Self.arguments(input: input, output: output, settings: fallback), durationSeconds: durationSeconds, onProgress: onProgress)
+                return EncodeOutput(outputURL: output, appliedSettings: fallback)
+            } catch {
+                // Wenn auch der Fallback scheitert, den urspruenglichen Fehler weiterreichen.
+                throw EncodeError.nonZeroExit(code: code, stderrTail: tail)
+            }
+        }
+    }
+
+    /// Encodiert die Quelle in eine lokale adaptive HLS-Leiter (Ziel B, 4K).
+    /// Ausgabe ist ein Ordner <id>-hls/ mit master.m3u8 + pro Sprosse einem
+    /// Unterordner (init.mp4 + seg_*.m4s + index.m3u8). yuv420p 8-bit, AAC.
+    func encodeHLS(
+        input: URL,
+        scratchDir: URL,
+        itemID: UUID,
+        durationSeconds: Double,
+        sourceWidth: Int,
+        hasAudio: Bool,
+        maxWidth: Int? = nil,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws -> URL {
+        let outputDir = scratchDir.appendingPathComponent("\(itemID.uuidString)-hls", isDirectory: true)
+        try? FileManager.default.removeItem(at: outputDir)
+        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        // ffmpeg legt die Varianten-Unterordner nicht selbst an.
+        for name in HLSLadderBuilder.variantNames(forSourceWidth: sourceWidth, maxWidth: maxWidth) {
+            try FileManager.default.createDirectory(
+                at: outputDir.appendingPathComponent(name, isDirectory: true),
+                withIntermediateDirectories: true)
+        }
+        let args = HLSLadderBuilder.ffmpegArguments(
+            input: input, outputDir: outputDir, sourceWidth: sourceWidth, hasAudio: hasAudio, maxWidth: maxWidth)
+        try await runFFmpegArgs(args, durationSeconds: durationSeconds, onProgress: onProgress)
+        return outputDir
+    }
+
+    /// Startet ffmpeg mit beliebigen Argumenten, liest stdout zeilenweise und parst
+    /// die -progress-Eintraege. Gemeinsam genutzt vom Einzeldatei- und HLS-Pfad.
+    private func runFFmpegArgs(
+        _ args: [String],
+        durationSeconds: Double,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        let ffmpeg = try FFmpegLocator.ffmpegURL()
+
+        let process = Process()
+        process.executableURL = ffmpeg
+        process.arguments = args
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        currentProcess = process
+
+        // stderr im Hintergrund einsammeln (fuer den Fehler-Tail).
+        let stderrActor = StderrCollector()
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty, let s = String(data: data, encoding: .utf8) {
+                Task { await stderrActor.append(s) }
+            }
+        }
+
+        try process.run()
+
+        // stdout zeilenweise lesen und out_time_us extrahieren.
+        // ffmpeg schreibt -progress als key=value-Bloecke, getrennt durch
+        // Zeilen "progress=continue" bzw. "progress=end".
+        let durationUs = max(durationSeconds, 0.001) * 1_000_000
+        await readProgress(from: stdoutPipe.fileHandleForReading, durationUs: durationUs, onProgress: onProgress)
+
+        process.waitUntilExit()
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        currentProcess = nil
+
+        let code = process.terminationStatus
+        if code != 0 {
+            let tail = await stderrActor.tail()
+            // SIGTERM/SIGKILL durch Cancel sauber unterscheiden.
+            if code == 15 || code == 9 {
+                throw EncodeError.cancelled
+            }
+            throw EncodeError.nonZeroExit(code: code, stderrTail: tail)
+        }
+        onProgress(1.0)
+    }
+
+    /// Liest den -progress-Stream zeilenweise und ruft onProgress mit 0..1.
+    private func readProgress(
+        from handle: FileHandle,
+        durationUs: Double,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async {
+        var buffer = Data()
+        // bytes(of:) gibt es nicht fuer FileHandle synchron; wir lesen blockweise.
+        // availableData blockt bis Daten da sind und liefert leer bei EOF.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                while true {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty { break } // EOF
+                    buffer.append(chunk)
+
+                    // Vollstaendige Zeilen verarbeiten.
+                    while let nl = buffer.firstIndex(of: 0x0A) {
+                        let lineData = buffer.subdata(in: buffer.startIndex..<nl)
+                        buffer.removeSubrange(buffer.startIndex...nl)
+                        guard let line = String(data: lineData, encoding: .utf8) else { continue }
+                        if let us = Self.parseOutTimeUs(line) {
+                            let pct = min(max(us / durationUs, 0), 0.999)
+                            onProgress(pct)
+                        }
+                    }
+                }
+                continuation.resume()
+            }
+        }
+    }
+
+    /// Extrahiert out_time_us aus einer -progress-Zeile, falls vorhanden.
+    static func parseOutTimeUs(_ line: String) -> Double? {
+        // Format: "out_time_us=12345678"
+        guard line.hasPrefix("out_time_us=") else { return nil }
+        let value = line.dropFirst("out_time_us=".count).trimmingCharacters(in: .whitespaces)
+        // ffmpeg liefert gelegentlich "N/A" am Anfang.
+        return Double(value)
+    }
+
+    // MARK: - Pause / Resume / Cancel
+
+    /// Optional: Encode-Pause ueber SIGSTOP (PLAN.md Abschnitt 8, nice-to-have).
+    func pause() {
+        guard let pid = currentProcess?.processIdentifier else { return }
+        kill(pid, SIGSTOP)
+    }
+
+    /// Optional: Encode fortsetzen ueber SIGCONT.
+    func resume() {
+        guard let pid = currentProcess?.processIdentifier else { return }
+        kill(pid, SIGCONT)
+    }
+
+    /// Harter Abbruch (Item geht zurueck auf queued, Teil-Output wird verworfen).
+    func cancel() {
+        currentProcess?.terminate()
+    }
+}
+
+/// Kleiner Aktor, der stderr-Fragmente sammelt und am Ende den Tail liefert.
+private actor StderrCollector {
+    private var buffer = ""
+    func append(_ s: String) { buffer += s }
+    func tail() -> String { buffer.trimmedTail() }
+}

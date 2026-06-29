@@ -1,0 +1,28 @@
+# Xcode / SwiftPM Build-Artefakte
+.build/
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+
+# Von XcodeGen generiert (aus macos-app/project.yml)
+macos-app/BDropUploader.xcodeproj/
+
+# Gebuendelte ffmpeg-Binaries (gross, GPL, nicht ins Repo)
+macos-app/Resources/ffmpeg/ffmpeg
+macos-app/Resources/ffmpeg/ffprobe
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# macOS
+.DS_Store
+
+# Signierte/notarisierte Artefakte
+*.dmg
+*.app
+*.zip

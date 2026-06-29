@@ -1,0 +1,77 @@
+name: macOS Build (Compile Smoke Test)
+
+# Reiner Kompilier-Test des Swift-Skeletts auf einem gehosteten macOS-Runner.
+# Signing/Notarisierung bewusst AUS - es geht nur darum, die Compile-Fehler
+# des nie-gebauten Codes sichtbar zu machen und iterativ abzuraeumen.
+# Manuell ausloesbar (workflow_dispatch) und bei Push auf macos-app/**.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'macos-app/**'
+      - '.github/workflows/macos-build.yml'
+
+jobs:
+  build:
+    name: Compile (Debug, unsigniert)
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: macos-app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain-Versionen
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: XcodeGen + xcbeautify installieren
+        run: brew install xcodegen xcbeautify
+
+      - name: ffmpeg-Resource-Ordner sicherstellen
+        run: |
+          # Echte ffmpeg/ffprobe-Binaries sind gitignored und fuer den reinen
+          # Compile nicht noetig (zur Laufzeit ueber FFmpegLocator aufgeloest).
+          # Der Resource-Ordner muss aber existieren, damit XcodeGen ihn findet.
+          mkdir -p Resources/ffmpeg
+          ls -la Resources/ffmpeg
+
+      - name: Xcode-Projekt aus project.yml generieren
+        run: xcodegen generate
+
+      - name: Build (Debug, ohne Code-Signing)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project BDropUploader.xcodeproj \
+            -target BDropUploader \
+            -configuration Debug \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            ENABLE_HARDENED_RUNTIME=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | xcbeautify
+
+      - name: Compiler-Fehler zusammenfassen
+        if: always()
+        run: |
+          echo "=== error:-Zeilen (max 100) ==="
+          grep -nE "error:" "$RUNNER_TEMP/xcodebuild.log" | head -100 || echo "keine error:-Zeilen gefunden"
+          echo ""
+          echo "=== warning:-Anzahl ==="
+          grep -cE "warning:" "$RUNNER_TEMP/xcodebuild.log" || true
+
+      - name: Build-Log als Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: warn

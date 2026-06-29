@@ -1,0 +1,73 @@
+# XcodeGen-Projektdefinition fuer die B-Drop Uploader Mac-App.
+# Generiere das .xcodeproj auf dem Mac mit:  xcodegen generate
+#
+# Hinweis: Diese Datei wurde auf einem Linux-VPS geschrieben und ist auf dem Mac
+# noch nicht gebaut/getestet worden. Beim ersten Build kann es kleinere
+# Anpassungen geben (z.B. an Build-Settings oder Resource-Pfaden).
+
+name: BDropUploader
+
+options:
+  bundleIdPrefix: com.jonasbomba
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    PRODUCT_BUNDLE_IDENTIFIER: com.jonasbomba.bdropuploader
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_LANGUAGE: de
+    # App-Sandbox ist bewusst AUS (Developer-ID/DMG-Vertrieb, ffmpeg-Subprozess
+    # braucht freien Dateizugriff). Hardened Runtime nur im Release (siehe configs).
+    ENABLE_HARDENED_RUNTIME: NO
+    # Signing-Team traegst du in Xcode ein (oder hier ueberschreiben):
+    # DEVELOPMENT_TEAM: XXXXXXXXXX
+    CODE_SIGN_STYLE: Automatic
+  configs:
+    Release:
+      ENABLE_HARDENED_RUNTIME: YES
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+    Debug:
+      ENABLE_HARDENED_RUNTIME: NO
+      SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+
+configs:
+  Debug: debug
+  Release: release
+
+targets:
+  BDropUploader:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    resources:
+      - path: Resources/ffmpeg
+        # Die ffmpeg/ffprobe-Binaries legst du selbst in Resources/ffmpeg/ ab
+        # (siehe Resources/ffmpeg/PLATZHALTER.md). Sie werden ins App-Bundle
+        # unter Contents/Resources/ffmpeg/ kopiert.
+    info:
+      path: Sources/App/Info.plist
+      properties:
+        CFBundleName: B-Drop Uploader
+        CFBundleDisplayName: B-Drop Uploader
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "14.0"
+        NSHighResolutionCapable: true
+        # Reine Hintergrund-/Uploader-App, erscheint normal im Dock.
+        LSApplicationCategoryType: public.app-category.video
+        # Hinweis fuer Notarisierung: ffmpeg ist GPL (x264/x265). Quellnachweis
+        # bei Weitergabe noetig (siehe PLAN.md Abschnitt 13.4).
+    settings:
+      base:
+        # Hardened Runtime im Release braucht diese Entitlements, damit ein
+        # gebuendeltes, separat signiertes ffmpeg als Child-Prozess starten darf.
+        CODE_SIGN_ENTITLEMENTS: Sources/App/BDropUploader.entitlements
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""

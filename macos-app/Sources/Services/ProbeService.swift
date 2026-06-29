@@ -1,0 +1,176 @@
+// ProbeService.swift
+//
+// Ruft ffprobe via Process auf, decodiert den JSON-Output und klassifiziert,
+// ob eine Quelle CF-tauglich (Smart-Remux), encode-noetig oder abzulehnen ist.
+// Setzt PLAN.md Abschnitt 5 (Encode-Strategie) und Abschnitt 10 (ProbeService) um.
+// Die App ist laut PLAN.md Abschnitt 4 die EINZIGE echte Codec-Schranke.
+//
+// Hinweis: Auf einem Linux-VPS geschrieben, auf dem Mac noch nicht gebaut.
+
+import Foundation
+
+/// Ergebnis einer ffprobe-Analyse, bereits klassifiziert.
+struct ProbeResult: Sendable {
+    var codec: String
+    var pixelFormat: String
+    var bitDepth: Int
+    var width: Int
+    var height: Int
+    var durationSeconds: Double
+    var hasAudio: Bool
+    /// Roher ffprobe-JSON (wird im QueueItem persistiert).
+    var rawJSON: String
+
+    enum Classification: Sendable {
+        /// Bereits CF-tauglich (H.264/HEVC, 8-bit, yuv420p) -> Smart-Remux.
+        case compatible
+        /// Encode noetig (ProRes, 10-bit, 4:2:2, exotisch).
+        case needsEncode
+        /// Nicht uploadbar (Bilddatei, r3d, braw, nicht abspielbar).
+        case reject(reason: String)
+    }
+
+    var classification: Classification
+}
+
+/// Fehler die der ProbeService werfen kann.
+enum ProbeError: LocalizedError {
+    case binaryNotFound
+    case processFailed(stderr: String)
+    case noVideoStream
+    case invalidJSON
+
+    var errorDescription: String? {
+        switch self {
+        case .binaryNotFound:
+            return "ffprobe wurde nicht gefunden (weder im Bundle noch unter /opt/homebrew/bin)."
+        case .processFailed(let stderr):
+            return "ffprobe ist fehlgeschlagen: \(stderr)"
+        case .noVideoStream:
+            return "Die Datei enthält keinen abspielbaren Videostream."
+        case .invalidJSON:
+            return "Der ffprobe-Output konnte nicht gelesen werden."
+        }
+    }
+}
+
+/// Liest Codec/Pixelformat/Bittiefe/Aufloesung/Dauer und klassifiziert die Quelle.
+struct ProbeService: Sendable {
+
+    /// Codecs die Cloudflare Stream ohne Re-Encode akzeptiert (PLAN.md Abschnitt 5).
+    private static let compatibleVideoCodecs: Set<String> = ["h264", "hevc"]
+
+    /// Pixelformate die als 8-bit 4:2:0 gelten (Smart-Remux-tauglich).
+    private static let compatiblePixelFormats: Set<String> = ["yuv420p", "yuvj420p"]
+
+    /// Container/Codecs die wir sofort ablehnen (RAW-Kamera-Formate, Bilder).
+    private static let rejectExtensions: Set<String> = ["r3d", "braw", "ari", "arx", "dpx", "jpg", "jpeg", "png", "tiff", "heic"]
+
+    /// Fuehrt ffprobe aus und liefert ein klassifiziertes Ergebnis.
+    /// - Parameter url: file://-URL der Quelldatei (Security-Scoped Zugriff muss
+    ///   vom Aufrufer bereits aktiv sein).
+    func probe(url: URL) throws -> ProbeResult {
+        // Schneller Endungs-Reject vor dem teuren Prozess.
+        let ext = url.pathExtension.lowercased()
+        if Self.rejectExtensions.contains(ext) {
+            return ProbeResult(
+                codec: ext, pixelFormat: "", bitDepth: 0, width: 0, height: 0,
+                durationSeconds: 0, hasAudio: false, rawJSON: "",
+                classification: .reject(reason: "Format \(ext.uppercased()) wird nicht unterstützt (RAW/Bild)."))
+        }
+
+        let ffprobe = try FFmpegLocator.ffprobeURL()
+
+        let args = [
+            "-v", "error",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            url.path
+        ]
+
+        let (status, stdout, stderr) = try ProcessRunner.run(executable: ffprobe, arguments: args)
+        guard status == 0 else {
+            throw ProbeError.processFailed(stderr: stderr.trimmedTail())
+        }
+
+        guard let data = stdout.data(using: .utf8),
+              let probe = try? JSONDecoder().decode(FFProbeOutput.self, from: data) else {
+            throw ProbeError.invalidJSON
+        }
+
+        guard let video = probe.streams.first(where: { $0.codec_type == "video" }) else {
+            throw ProbeError.noVideoStream
+        }
+
+        let codec = (video.codec_name ?? "").lowercased()
+        let pixFmt = (video.pix_fmt ?? "").lowercased()
+        let bitDepth = Self.bitDepth(forPixelFormat: pixFmt, fallback: video.bits_per_raw_sample)
+        let width = video.width ?? 0
+        let height = video.height ?? 0
+        let hasAudio = probe.streams.contains { $0.codec_type == "audio" }
+
+        // Dauer: zuerst format.duration, sonst stream.duration.
+        let duration = Double(probe.format?.duration ?? video.duration ?? "0") ?? 0
+
+        let classification = Self.classify(
+            codec: codec, pixelFormat: pixFmt, bitDepth: bitDepth, width: width, height: height)
+
+        return ProbeResult(
+            codec: codec,
+            pixelFormat: pixFmt,
+            bitDepth: bitDepth,
+            width: width,
+            height: height,
+            durationSeconds: duration,
+            hasAudio: hasAudio,
+            rawJSON: stdout,
+            classification: classification)
+    }
+
+    // MARK: - Klassifikation
+
+    private static func classify(codec: String, pixelFormat: String, bitDepth: Int, width: Int, height: Int) -> ProbeResult.Classification {
+        guard width > 0, height > 0 else {
+            return .reject(reason: "Keine gültige Auflösung im Videostream.")
+        }
+        let is8bit = bitDepth <= 8
+        let codecOK = compatibleVideoCodecs.contains(codec)
+        let pixOK = compatiblePixelFormats.contains(pixelFormat)
+
+        if codecOK && pixOK && is8bit {
+            return .compatible
+        }
+        // Alles andere ist encodierbar (ProRes, 10-bit, 4:2:2, exotisch).
+        return .needsEncode
+    }
+
+    /// Leitet die Bittiefe aus dem Pixelformat ab, mit Fallback auf bits_per_raw_sample.
+    private static func bitDepth(forPixelFormat pix: String, fallback: String?) -> Int {
+        if pix.contains("p10") || pix.contains("10le") || pix.contains("10be") { return 10 }
+        if pix.contains("p12") || pix.contains("12le") || pix.contains("12be") { return 12 }
+        if pix.contains("p16") { return 16 }
+        if let f = fallback, let n = Int(f), n > 0 { return n }
+        return 8
+    }
+}
+
+// MARK: - ffprobe-JSON-Decodables
+
+/// Schlanke Decodable-Struktur fuer den relevanten Teil des ffprobe-JSON.
+private struct FFProbeOutput: Decodable {
+    struct Stream: Decodable {
+        var codec_type: String?
+        var codec_name: String?
+        var pix_fmt: String?
+        var bits_per_raw_sample: String?
+        var width: Int?
+        var height: Int?
+        var duration: String?
+    }
+    struct Format: Decodable {
+        var duration: String?
+    }
+    var streams: [Stream]
+    var format: Format?
+}

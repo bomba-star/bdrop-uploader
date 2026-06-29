@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bdrop-encode"
+version = "0.1.0"
+description = "Referenz-Engine fuer den B-Drop Uploader (Ziel A, CF-Stream-Weg)"
+requires-python = ">=3.10"
+# Bewusst KEINE externen Abhaengigkeiten: nur Standardbibliothek + ffmpeg/ffprobe.
+dependencies = []
+
+[project.scripts]
+bdrop-encode = "bdrop_encode.cli:main"
+
+[tool.setuptools]
+packages = ["bdrop_encode"]
