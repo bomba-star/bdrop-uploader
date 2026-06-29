@@ -6,6 +6,7 @@
 // Hinweis: Auf einem Linux-VPS geschrieben, auf dem Mac noch nicht gebaut.
 
 import SwiftUI
+import AppKit
 
 struct QueueListView: View {
     @Environment(QueueStore.self) private var queue
@@ -29,6 +30,13 @@ struct QueueRowView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
+                if let tp = item.thumbnailPath, let img = NSImage(contentsOfFile: tp) {
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 48, height: 27)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
                 phaseBadge
                 Text(item.displayName)
                     .lineLimit(1)

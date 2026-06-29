@@ -280,6 +280,38 @@ actor EncodeService {
         return Double(value)
     }
 
+    // MARK: - Smart-Thumbnail (Poster-Frame)
+
+    /// Extrahiert einen einzelnen Frame als JPG (Poster). Best effort: liefert nil,
+    /// wenn ffmpeg fehlt oder der Frame nicht erzeugt werden konnte. Laeuft im
+    /// Aktor (nicht auf dem MainActor), darf also kurz blockieren.
+    func generateThumbnail(input: URL, scratchDir: URL, itemID: UUID, atSeconds: Double) -> URL? {
+        guard let ffmpeg = try? FFmpegLocator.ffmpegURL() else { return nil }
+        try? FileManager.default.createDirectory(at: scratchDir, withIntermediateDirectories: true)
+        let out = scratchDir.appendingPathComponent("\(itemID.uuidString)-thumb.jpg")
+        try? FileManager.default.removeItem(at: out)
+
+        let process = Process()
+        process.executableURL = ffmpeg
+        process.arguments = [
+            "-ss", String(format: "%.2f", max(0, atSeconds)),
+            "-i", input.path,
+            "-frames:v", "1",
+            "-vf", "scale=480:-2",
+            "-y", out.path,
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+        let ok = process.terminationStatus == 0 && FileManager.default.fileExists(atPath: out.path)
+        return ok ? out : nil
+    }
+
     // MARK: - Pause / Resume / Cancel
 
     /// Optional: Encode-Pause ueber SIGSTOP (PLAN.md Abschnitt 8, nice-to-have).

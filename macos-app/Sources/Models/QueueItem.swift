@@ -48,6 +48,9 @@ final class QueueItem {
     /// Pfad des fertig encodierten Masters im Scratch (zum Upload und spaeteren Loeschen).
     var outputPath: String?
 
+    /// Pfad eines generierten Poster-Frames (Smart-Thumbnail), optional.
+    var thumbnailPath: String?
+
     // MARK: - Server-Zuordnung (UI + Idempotenz)
 
     /// Zielprojekt auf dem Server.

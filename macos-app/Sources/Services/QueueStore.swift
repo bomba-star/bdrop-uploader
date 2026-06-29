@@ -217,6 +217,14 @@ final class QueueStore {
             save(); reload(); return
         }
 
+        // Smart-Thumbnail (Poster-Frame, best effort, blockiert die Pipeline nicht).
+        let thumbAt = min(max(probe.durationSeconds * 0.1, 1.0), max(probe.durationSeconds - 0.5, 1.0))
+        if let thumb = await encodeService.generateThumbnail(
+            input: url, scratchDir: scratchDir, itemID: item.id, atSeconds: thumbAt) {
+            item.thumbnailPath = thumb.path
+            save(); reload()
+        }
+
         // item (SwiftData @Model) ist nicht Sendable und darf nicht in die
         // @Sendable onProgress-Closure gefangen werden. Stattdessen die Sendable
         // UUID fangen und das Item auf dem MainActor ueber die items-Liste finden.
