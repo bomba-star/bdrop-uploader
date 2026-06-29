@@ -71,7 +71,7 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             ENABLE_HARDENED_RUNTIME=NO \
-            -derivedDataPath "$RUNNER_TEMP/dd" \
+            SYMROOT="$RUNNER_TEMP/build" \
             build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | xcbeautify
 
       - name: Compiler-Fehler zusammenfassen
@@ -94,13 +94,13 @@ jobs:
       - name: App packen (unsigniert)
         if: success()
         run: |
-          APP="$RUNNER_TEMP/dd/Build/Products/Debug/BDropUploader.app"
+          APP="$RUNNER_TEMP/build/Debug/BDropUploader.app"
           if [ -d "$APP" ]; then
             ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/BDropUploader.app.zip"
             echo "App gepackt: $APP"
           else
             echo "App nicht gefunden unter $APP"
-            ls -R "$RUNNER_TEMP/dd/Build/Products" || true
+            ls -R "$RUNNER_TEMP/build" || true
             exit 1
           fi
 

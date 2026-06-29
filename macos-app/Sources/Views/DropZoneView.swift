@@ -9,6 +9,14 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+import AppKit
+
+/// Bekannte Video-Endungen (entsprechen den vom Server akzeptierten Formaten).
+/// Datei-Ebene -> nonisolated, von Hintergrund-Kontexten aus nutzbar.
+private let dropZoneVideoExtensions: Set<String> = [
+    "mp4", "mov", "m4v", "mkv", "avi", "mxf", "mpg", "mpeg",
+    "ts", "mts", "m2ts", "wmv", "flv", "webm", "3gp", "ogv", "dv",
+]
 
 struct DropZoneView: View {
     @Environment(QueueStore.self) private var queue
@@ -21,10 +29,17 @@ struct DropZoneView: View {
                 .foregroundStyle(isTargeted ? Color.accentColor : .secondary)
             Text("Videos hierher ziehen")
                 .font(.headline)
-            Text("Mehrere Dateien gleichzeitig möglich. Uploads laufen auch nach dem Schließen weiter.")
+            Text("Mehrere Dateien gleichzeitig möglich. Ganze Ordner werden rekursiv nach Videos durchsucht. Uploads laufen auch nach dem Schließen weiter.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            Button {
+                chooseFilesOrFolders()
+            } label: {
+                Label("Dateien oder Ordner wählen", systemImage: "folder.badge.plus")
+            }
+            .buttonStyle(.bordered)
+            .padding(.top, 2)
         }
         .frame(maxWidth: .infinity, minHeight: 120)
         .padding()
@@ -73,26 +88,62 @@ struct DropZoneView: View {
         return nil
     }
 
-    /// Erzeugt ein Security-Scoped Bookmark und uebergibt es dem QueueStore.
-    /// nonisolated: laeuft in der Hintergrund-Completion; die Bookmark-/IO-Aufrufe
-    /// sind threadsicher, der QueueStore-Zugriff hoppt am Ende selbst auf den MainActor.
+    /// Oeffnet einen Datei-/Ordner-Dialog (Mehrfachauswahl) und legt die Auswahl an.
+    private func chooseFilesOrFolders() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Hinzufügen"
+        panel.message = "Videos oder Ordner mit Videos wählen"
+        guard panel.runModal() == .OK else { return }
+        let queue = queue
+        for url in panel.urls {
+            DispatchQueue.global(qos: .userInitiated).async {
+                Self.ingest(url: url, into: queue)
+            }
+        }
+    }
+
+    /// Erzeugt Security-Scoped Bookmarks und uebergibt sie dem QueueStore.
+    /// Ein Verzeichnis wird rekursiv nach Video-Dateien durchsucht.
+    /// nonisolated: laeuft in der Hintergrund-Completion bzw. auf einer Background-Queue.
     private nonisolated static func ingest(url: URL, into queue: QueueStore) {
-        // Security-Scoped Zugriff oeffnen, Bookmark erzeugen, Zugriff wieder schliessen.
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
 
-        let bookmark = try? url.bookmarkData(
-            options: [.withSecurityScope],
-            includingResourceValuesForKeys: nil,
-            relativeTo: nil)
+        var isDir: ObjCBool = false
+        FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+        let candidates: [URL] = isDir.boolValue ? videoFiles(in: url) : [url]
 
-        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { Int64($0) }
-        let name = url.lastPathComponent
-
-        guard let bookmark else { return }
-
-        Task { @MainActor in
-            queue.enqueue(bookmark: bookmark, displayName: name, sourceSize: size)
+        for fileURL in candidates {
+            guard isVideo(fileURL) else { continue }
+            guard let bookmark = try? fileURL.bookmarkData(
+                options: [.withSecurityScope],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil) else { continue }
+            let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { Int64($0) }
+            let name = fileURL.lastPathComponent
+            Task { @MainActor in
+                queue.enqueue(bookmark: bookmark, displayName: name, sourceSize: size)
+            }
         }
+    }
+
+    private nonisolated static func isVideo(_ url: URL) -> Bool {
+        dropZoneVideoExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// Sammelt rekursiv alle Video-Dateien unterhalb eines Verzeichnisses.
+    private nonisolated static func videoFiles(in directory: URL) -> [URL] {
+        guard let en = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]) else { return [] }
+        var result: [URL] = []
+        for case let fileURL as URL in en where isVideo(fileURL) {
+            result.append(fileURL)
+        }
+        return result.sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 }
