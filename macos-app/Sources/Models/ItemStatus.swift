@@ -71,7 +71,7 @@ enum UploadTarget: String, Codable, CaseIterable, Sendable {
     var germanLabel: String {
         switch self {
         case .cfStream:  return "Cloudflare Stream (Upload)"
-        case .r2HLS:     return "4K-HLS auf R2 (Upload, folgt)"
+        case .r2HLS:     return "4K-HLS auf R2 (Upload)"
         case .localH264: return "Nur umwandeln: H.264-Master (lokal)"
         case .localHLS:  return "Nur umwandeln: 4K-HLS-Leiter (lokal)"
         }

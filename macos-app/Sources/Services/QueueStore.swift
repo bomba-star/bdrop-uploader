@@ -267,9 +267,10 @@ final class QueueStore {
                 if target.isLocal {
                     finishLocalExport(item, from: outDir, isDirectory: true)
                 } else {
-                    // r2HLS: lokal erzeugt, aber der R2-Upload ist noch nicht
-                    // freigeschaltet (Track B) - ehrlich als fehlgeschlagen markieren (Fix 17).
-                    item.markFailed("4K-HLS lokal erzeugt - der R2-Upload ist noch nicht freigeschaltet (Track B).")
+                    // r2HLS: die lokal erzeugte Leiter nach R2 hochladen und (best
+                    // effort) den r2_hls_path setzen (Track B). Laeuft bewusst innerhalb
+                    // der Encode-Stufe - der Encode-Slot bleibt bis zum Ende belegt.
+                    await runR2HLSUpload(item, outDir: outDir)
                 }
                 save(); reload()
             } catch EncodeError.cancelled {
@@ -390,6 +391,107 @@ final class QueueStore {
             UserDefaults.standard.set(data, forKey: Self.exportDirKey)
             exportDirectoryPath = url.path
         }
+    }
+
+    // MARK: - Ziel B: 4K-HLS-Upload nach R2 (Track B)
+
+    /// Laedt eine lokal erzeugte HLS-Leiter nach R2 und aktiviert (best effort) den
+    /// r2_hls_path. Wird aus runProbeAndEncode heraus aufgerufen und laeuft innerhalb
+    /// der Encode-Stufe (der Encode-Slot wird erst per defer in runProbeAndEncode frei).
+    private func runR2HLSUpload(_ item: QueueItem, outDir: URL) async {
+        // R2-Konfiguration + Credentials laden. Fehlt etwas -> ehrlich fehlschlagen.
+        guard let r2config = R2Config.load(), r2config.isComplete,
+              let creds = tokenStore.r2Credentials() else {
+            item.markFailed("4K-HLS erzeugt - R2 nicht konfiguriert. Bitte R2-Zugang in den Einstellungen eintragen.")
+            save(); reload(); return
+        }
+
+        // video_id besorgen (wie beim cfStream-Pfad): bestehendes Video bevorzugen,
+        // sonst neu anlegen. resolvedVideoID wird in allen Pfaden gesetzt.
+        var resolvedVideoID: String
+        if let existing = item.serverVideoId {
+            resolvedVideoID = existing
+        } else if let existingVideo = item.newVersionOfVideoId {
+            resolvedVideoID = existingVideo
+            item.serverVideoId = existingVideo
+            save()
+        } else {
+            do {
+                resolvedVideoID = try await apiClient.createVideo(
+                    name: item.displayName,
+                    projectID: item.projectId,
+                    folderID: item.folderId)
+            } catch let error as ApiError where error == .unauthorized {
+                handleUnauthorized()
+                guard items.contains(where: { $0.id == item.id }) else { return }
+                item.markFailed(ApiError.unauthorized.localizedDescription)
+                save(); reload(); return
+            } catch {
+                guard items.contains(where: { $0.id == item.id }) else { return }
+                item.markFailed("Video anlegen fehlgeschlagen: \(error.localizedDescription)")
+                save(); reload(); return
+            }
+            // Use-after-delete-Schutz nach dem createVideo-await (Fix 13).
+            guard items.contains(where: { $0.id == item.id }) else { return }
+            item.serverVideoId = resolvedVideoID
+            save()
+            // Backend-Optionen best effort setzen (blockiert den Upload nicht).
+            _ = try? await apiClient.updateVideo(
+                videoID: resolvedVideoID,
+                downloadsEnabled: defaultDownloadsEnabled,
+                downloadFormats: defaultDownloadsEnabled ? defaultDownloadFormats : nil,
+                versionSwitcherEnabled: defaultVersionSwitcher)
+        }
+        let videoID = resolvedVideoID
+
+        // Use-after-delete-Schutz nach den Video-awaits (Fix 13).
+        guard items.contains(where: { $0.id == item.id }) else { return }
+
+        // Upload-Phase.
+        item.status = .uploading
+        item.setProgress(0)
+        save(); reload()
+
+        // item ist nicht Sendable -> nur die Sendable-UUID in die @Sendable-Closure fangen.
+        let progressItemID = item.id
+        let onR2Progress: @Sendable (Double) -> Void = { [weak self] pct in
+            Task { @MainActor in
+                self?.items.first(where: { $0.id == progressItemID })?.setProgress(pct)
+            }
+        }
+
+        let uploader = R2Uploader(
+            config: r2config, accessKeyId: creds.accessKey, secretAccessKey: creds.secretKey)
+        do {
+            try await uploader.uploadTree(localDir: outDir, videoID: videoID, onProgress: onR2Progress)
+        } catch {
+            // Use-after-delete-Schutz vor dem Mutieren (Fix 13).
+            guard items.contains(where: { $0.id == item.id }) else { return }
+            item.markFailed("R2-Upload fehlgeschlagen: \(error.localizedDescription)")
+            notifyTerminal(item, success: false)
+            save(); reload(); return
+        }
+
+        // Use-after-delete-Schutz nach dem Upload-await (Fix 13).
+        guard items.contains(where: { $0.id == item.id }) else { return }
+
+        // Aktivierung (best effort): r2_hls_path setzen. Das Backend unterstuetzt das
+        // evtl. noch nicht -> bewusst mit try? ignorieren (Fehler darf den Erfolg nicht kippen).
+        let masterPath = "hls/videos/\(videoID)/master.m3u8"
+        _ = try? await apiClient.setR2HlsPath(videoID: videoID, path: masterPath)
+
+        // Use-after-delete-Schutz nach dem Aktivierungs-await (Fix 13).
+        guard items.contains(where: { $0.id == item.id }) else { return }
+
+        item.status = .done
+        item.setProgress(1)
+        item.lastError = nil
+        lastStatusMessage = "4K-HLS nach R2 hochgeladen. Die Player-Aktivierung (r2_hls_path) muss ggf. noch serverseitig freigeschaltet werden."
+        // Scratch-HLS-Ordner aufraeumen (liegt jetzt auf R2). Analog zum cfStream-Verify.
+        try? FileManager.default.removeItem(at: outDir)
+        item.outputPath = nil
+        notifyTerminal(item, success: true)
+        save(); reload()
     }
 
     // MARK: - Stufe 2: Upload + Verify (1-2 parallel)
@@ -635,8 +737,19 @@ final class QueueStore {
                 item.setProgress(0)
 
             case .uploading:
-                // 3) Upload mit version_id -> erst cf-refresh pollen.
-                if let versionID = item.serverVersionId {
+                if item.target.producesHLS {
+                    // r2HLS laeuft im Vordergrund (kein Background-Daemon, keine
+                    // version_id). Nach einem Crash gibt es keinen laufenden Transfer ->
+                    // sauber neu durch die Encode-/Upload-Stufe. Der Re-Encode ueber-
+                    // schreibt den ggf. unvollstaendigen HLS-Ordner ohnehin.
+                    if let path = item.outputPath {
+                        try? FileManager.default.removeItem(atPath: path)
+                        item.outputPath = nil
+                    }
+                    item.status = .queued
+                    item.setProgress(0)
+                } else if let versionID = item.serverVersionId {
+                    // 3) Upload mit version_id -> erst cf-refresh pollen.
                     // In der Verify-Phase weiter, das Polling erledigt den Rest.
                     Task { @MainActor in
                         do { try await self.verify(item: item, versionID: versionID) }

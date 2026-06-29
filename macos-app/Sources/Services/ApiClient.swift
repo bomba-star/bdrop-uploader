@@ -341,6 +341,19 @@ struct ApiClient: Sendable {
         return try await sendDecoding(req)
     }
 
+    // MARK: - R2-HLS-Pfad setzen (Track B, Aktivierung)
+
+    /// PATCH /api/admin/videos/{id} mit {"r2_hls_path": path}.
+    /// Aktiviert die R2-HLS-Quelle fuer den Player. ACHTUNG: Das Backend unterstuetzt
+    /// dieses Feld evtl. noch NICHT - der Aufrufer ruft es daher best effort (try?).
+    func setR2HlsPath(videoID: String, path: String) async throws -> VideoDTO {
+        let body: [String: Any] = ["r2_hls_path": path]
+        var req = try makeRequest(path: "\(AppConfig.adminPath)/videos/\(videoID)", method: "PATCH")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return try await sendDecoding(req)
+    }
+
     // MARK: - Review-Links anlegen
 
     /// POST /api/admin/videos/{id}/links

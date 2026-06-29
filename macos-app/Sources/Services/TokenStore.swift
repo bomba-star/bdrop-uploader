@@ -27,8 +27,12 @@ final class TokenStore: @unchecked Sendable {
     /// Reaktive Anzeige, ob aktuell ein Admin-Token hinterlegt ist (nicht der Token selbst).
     private(set) var hasAdminToken: Bool = false
 
+    /// Reaktive Anzeige, ob R2-Credentials (Access-Key + Secret) hinterlegt sind.
+    private(set) var hasR2Credentials: Bool = false
+
     init() {
         hasAdminToken = (adminToken() != nil)
+        hasR2Credentials = (r2Credentials() != nil)
     }
 
     // MARK: - Admin-Token
@@ -55,20 +59,33 @@ final class TokenStore: @unchecked Sendable {
         return ok
     }
 
-    // MARK: - R2-Credentials (Ziel B, optional)
+    // MARK: - R2-Credentials (Ziel B / Track B: 4K-HLS-Upload nach R2)
 
-    /// TODO(Ziel B): R2-Credentials fuer den Direkt-Upload-Pfad. Aktuell ungenutzt.
+    /// Liest Access-Key-ID + Secret-Access-Key aus der Keychain (nil, wenn unvollstaendig).
     func r2Credentials() -> (accessKey: String, secretKey: String)? {
         guard let a = read(account: KeychainKeys.r2AccessKeyAccount),
               let s = read(account: KeychainKeys.r2SecretKeyAccount) else { return nil }
         return (a, s)
     }
 
-    /// TODO(Ziel B): R2-Credentials setzen.
+    /// Schreibt (oder ersetzt) die R2-Credentials. Beide Werte werden getrimmt.
     @discardableResult
     func setR2Credentials(accessKey: String, secretKey: String) -> Bool {
-        write(account: KeychainKeys.r2AccessKeyAccount, value: accessKey)
-            && write(account: KeychainKeys.r2SecretKeyAccount, value: secretKey)
+        let a = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let s = secretKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ok = write(account: KeychainKeys.r2AccessKeyAccount, value: a)
+            && write(account: KeychainKeys.r2SecretKeyAccount, value: s)
+        hasR2Credentials = ok && !a.isEmpty && !s.isEmpty
+        return ok
+    }
+
+    /// Loescht die R2-Credentials aus der Keychain.
+    @discardableResult
+    func clearR2Credentials() -> Bool {
+        let ok = delete(account: KeychainKeys.r2AccessKeyAccount)
+            && delete(account: KeychainKeys.r2SecretKeyAccount)
+        hasR2Credentials = false
+        return ok
     }
 
     // MARK: - Keychain-Primitiven

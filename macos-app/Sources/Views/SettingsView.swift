@@ -20,6 +20,15 @@ struct SettingsView: View {
     @State private var isLoading = false
     @State private var isChoosingExportDir = false
 
+    // R2-Zugang (Track B). Die geheimen Schluessel werden nach dem Speichern wieder
+    // geleert; nur die nicht-geheime Konfiguration wird beim Oeffnen vorbefuellt.
+    @State private var r2AccountId: String = ""
+    @State private var r2Bucket: String = ""
+    @State private var r2Endpoint: String = ""
+    @State private var r2Region: String = "auto"
+    @State private var r2AccessKeyId: String = ""
+    @State private var r2SecretKey: String = ""
+
     var body: some View {
         Form {
             tokenSection
@@ -27,12 +36,14 @@ struct SettingsView: View {
             exportSection
             destinationSection
             videoOptionsSection
+            r2Section
             limitsSection
         }
         .formStyle(.grouped)
         .frame(width: 460)
         .padding()
         .task {
+            loadR2ConfigIntoFields()
             await loadProjectsIfPossible()
         }
     }
@@ -82,7 +93,7 @@ struct SettingsView: View {
                     Text(q.germanLabel).tag(q)
                 }
             }
-            Text("Ziel: Cloudflare Stream (H.264-Master) oder 4K-HLS (adaptive Leiter, R2-Upload folgt). Qualität: Proxy 720p und Review 1080p nutzen die Hardware-Engine (schnell); Hoch 1080p und 4K-Master encodieren in Software (langsamer, bessere Qualität pro Bit). Die Stufe begrenzt auch die Auflösung bzw. die HLS-Leiter.")
+            Text("Ziel: Cloudflare Stream (H.264-Master) oder 4K-HLS (adaptive Leiter, Upload nach R2 - dafür den R2-Zugang unten eintragen). Qualität: Proxy 720p und Review 1080p nutzen die Hardware-Engine (schnell); Hoch 1080p und 4K-Master encodieren in Software (langsamer, bessere Qualität pro Bit). Die Stufe begrenzt auch die Auflösung bzw. die HLS-Leiter.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -197,6 +208,81 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - R2-Zugang (fuer 4K-HLS-Upload)
+
+    private var r2Section: some View {
+        Section("R2-Zugang (für 4K-HLS-Upload)") {
+            TextField("Account-ID", text: $r2AccountId)
+            TextField("Bucket", text: $r2Bucket)
+            TextField("Endpoint", text: $r2Endpoint)
+                .help("z.B. https://<account-id>.r2.cloudflarestorage.com")
+            TextField("Region", text: $r2Region)
+            TextField("Access-Key-ID", text: $r2AccessKeyId)
+            SecureField("Secret Access Key", text: $r2SecretKey)
+
+            Button("R2-Zugang speichern") { saveR2() }
+                .disabled(!canSaveR2)
+
+            HStack {
+                Image(systemName: r2Configured ? "checkmark.seal.fill" : "xmark.seal")
+                    .foregroundStyle(r2Configured ? .green : .secondary)
+                Text(r2Configured
+                     ? "R2-Zugang vollständig hinterlegt."
+                     : "R2-Zugang noch unvollständig.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if tokens.hasR2Credentials {
+                    Button("Zugang löschen", role: .destructive) {
+                        tokens.clearR2Credentials()
+                    }
+                }
+            }
+
+            Text("Nötig für das Ziel \"4K-HLS auf R2\". Access-Key + Secret landen in der Keychain, die übrige Konfiguration lokal. Der Endpoint hat die Form https://<account-id>.r2.cloudflarestorage.com.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// True, wenn Pflichtfelder fuer ein Speichern ausgefuellt sind.
+    private var canSaveR2: Bool {
+        func filled(_ s: String) -> Bool { !s.trimmingCharacters(in: .whitespaces).isEmpty }
+        return filled(r2AccountId) && filled(r2Bucket) && filled(r2Endpoint)
+            && filled(r2AccessKeyId) && !r2SecretKey.isEmpty
+    }
+
+    /// True, wenn Konfiguration vollstaendig gespeichert UND Credentials in der Keychain sind.
+    private var r2Configured: Bool {
+        (R2Config.load()?.isComplete ?? false) && tokens.hasR2Credentials
+    }
+
+    /// Befuellt die Eingabefelder mit der gespeicherten (nicht-geheimen) Konfiguration.
+    private func loadR2ConfigIntoFields() {
+        guard let cfg = R2Config.load() else { return }
+        r2AccountId = cfg.accountId
+        r2Bucket = cfg.bucket
+        r2Endpoint = cfg.endpoint
+        r2Region = cfg.region.isEmpty ? "auto" : cfg.region
+    }
+
+    /// Speichert Konfiguration (UserDefaults) + Credentials (Keychain) und leert die
+    /// geheimen Felder wieder.
+    private func saveR2() {
+        func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let region = trimmed(r2Region).isEmpty ? "auto" : trimmed(r2Region)
+        let cfg = R2Config(
+            accountId: trimmed(r2AccountId),
+            bucket: trimmed(r2Bucket),
+            endpoint: trimmed(r2Endpoint),
+            region: region)
+        cfg.save()
+        r2Region = region
+        tokens.setR2Credentials(accessKey: r2AccessKeyId, secretKey: r2SecretKey)
+        r2AccessKeyId = ""
+        r2SecretKey = ""
+    }
+
     // MARK: - Limits-Hinweis
 
     private var limitsSection: some View {
@@ -205,7 +291,7 @@ struct SettingsView: View {
                 .font(.caption)
             Label("Upload bis 32 GiB pro Datei (Server-Grenze).", systemImage: "internaldrive")
                 .font(.caption)
-            Label("4K-HLS: lokale Umwandlung bis 2160p vorhanden, der R2-Upload folgt.", systemImage: "4k.tv")
+            Label("4K-HLS: lokale Umwandlung bis 2160p; Upload nach R2, sobald der R2-Zugang hinterlegt ist.", systemImage: "4k.tv")
                 .font(.caption)
         }
     }
