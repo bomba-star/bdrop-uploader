@@ -95,16 +95,16 @@ actor EncodeService {
             // Schneller Faststart-Remux ohne Generationsverlust (PLAN.md Abschnitt 5).
             // Video immer kopieren; Audio nur kopieren, wenn es MP4-nativ ist, sonst
             // nach AAC umcodieren - `-c copy` wuerde inkompatibles Audio mitschleppen (Fix 6).
-            let audioArgs = settings.audioNeedsTranscode
+            let audioArgs: [String] = settings.audioNeedsTranscode
                 ? ["-c:a", "aac", "-b:a", AppConfig.audioBitrate]
                 : ["-c:a", "copy"]
-            return ["-i", input.path]
-                + ["-c:v", "copy"]
-                + audioArgs
-                + ["-movflags", "+faststart"]
-                + ["-tag:v", settings.videoTag]
-                + progress
-                + [output.path]
+            // Akkumulator statt langer +-Kette: vermeidet den Swift-Type-Checker-Timeout.
+            var args: [String] = ["-i", input.path, "-c:v", "copy"]
+            args += audioArgs
+            args += ["-movflags", "+faststart", "-tag:v", settings.videoTag]
+            args += progress
+            args.append(output.path)
+            return args
 
         case .hardwareH264:
             // Review-Master, Hardware, akkuschonend. Optionaler Aufloesungs-Cap.
