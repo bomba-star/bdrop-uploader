@@ -24,6 +24,7 @@ struct QueueListView: View {
 struct QueueRowView: View {
     @Environment(QueueStore.self) private var queue
     let item: QueueItem
+    @State private var editingItem: QueueItem?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -58,6 +59,9 @@ struct QueueRowView: View {
             }
         }
         .padding(.vertical, 4)
+        .sheet(item: $editingItem) { editItem in
+            ItemEditorView(item: editItem)
+        }
     }
 
     // MARK: - Phase-Badge (deutsch)
@@ -87,6 +91,16 @@ struct QueueRowView: View {
     @ViewBuilder
     private var actions: some View {
         HStack(spacing: 8) {
+            if item.status == .queued {
+                Button {
+                    editingItem = item
+                } label: {
+                    Label("Bearbeiten", systemImage: "slider.horizontal.3")
+                }
+                .help("Optionen bearbeiten (Ziel, Qualität, Projekt, Version)")
+                .labelStyle(.iconOnly)
+            }
+
             if item.status.isRetryable {
                 Button {
                     queue.retry(item)

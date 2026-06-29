@@ -32,8 +32,15 @@ final class QueueItem {
 
     // MARK: - Ziel und Encode
 
-    /// cfStream (Ziel A) oder r2HLS (Ziel B, noch nicht implementiert).
+    /// cfStream / r2HLS / lokaler Export. Pro Item editierbar (vor Start).
     var targetRaw: String
+
+    /// Gewuenschte Encode-Qualitaet pro Item (vor dem Encode editierbar).
+    var qualityRaw: String = EncodeQuality.reviewFast.rawValue
+
+    /// Wenn gesetzt: als neue Version dieses bestehenden Videos hochladen
+    /// (kein neues Video anlegen). Steuert den Upload-Pfad.
+    var newVersionOfVideoId: String?
 
     /// Eingefrorener Encode-Plan als JSON (EncodeSettings).
     var encodeSettingsJSON: String?
@@ -119,6 +126,12 @@ final class QueueItem {
     var target: UploadTarget {
         get { UploadTarget(rawValue: targetRaw) ?? .cfStream }
         set { targetRaw = newValue.rawValue }
+    }
+
+    /// Typ-sicherer Zugriff auf die gewuenschte Encode-Qualitaet.
+    var quality: EncodeQuality {
+        get { EncodeQuality(rawValue: qualityRaw) ?? .reviewFast }
+        set { qualityRaw = newValue.rawValue }
     }
 
     /// Decodierter Encode-Plan-Snapshot, falls vorhanden.

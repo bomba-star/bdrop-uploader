@@ -127,6 +127,17 @@ struct LinkOut: Decodable, Sendable {
     var url: String?
 }
 
+/// Schlanke Video-Zusammenfassung fuer die Neue-Version-Auswahl.
+struct VideoSummaryDTO: Decodable, Identifiable, Sendable, Hashable {
+    var id: String
+    var title: String
+}
+
+/// Envelope fuer GET /api/admin/projects/{id} (nur die videos-Liste interessiert hier).
+private struct ProjectDetailEnvelope: Decodable {
+    var videos: [VideoSummaryDTO]?
+}
+
 // MARK: - Fehler
 
 /// API-Fehler, sauber nach Kategorie getrennt (PLAN.md Abschnitt 9).
@@ -193,6 +204,14 @@ struct ApiClient: Sendable {
         let req = try makeRequest(path: "\(AppConfig.adminPath)/projects/\(projectID)/folders", method: "GET")
         let envelope: FoldersEnvelope = try await sendDecoding(req)
         return envelope.folders
+    }
+
+    /// Videos eines Projekts (fuer die Neue-Version-Auswahl).
+    /// GET /api/admin/projects/{id} liefert {..., videos:[...]}.
+    func listVideos(projectID: String) async throws -> [VideoSummaryDTO] {
+        let req = try makeRequest(path: "\(AppConfig.adminPath)/projects/\(projectID)", method: "GET")
+        let envelope: ProjectDetailEnvelope = try await sendDecoding(req)
+        return envelope.videos ?? []
     }
 
     // MARK: - Video anlegen (PLAN.md Abschnitt 7, Schritt 1)

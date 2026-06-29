@@ -111,6 +111,11 @@ final class QueueStore {
         try? modelContext.save()
     }
 
+    /// Persistiert Editor-Aenderungen an einem Item (vom ItemEditor aufgerufen).
+    func persistEdits() {
+        save(); reload()
+    }
+
     // MARK: - Drop -> neues Item (PLAN.md Abschnitt 11, Schritt 1)
 
     /// Erzeugt ein QueueItem aus einer gedroppten Datei-URL.
@@ -128,6 +133,7 @@ final class QueueStore {
             projectId: defaultProjectID,
             folderId: defaultFolderID)
         item.sourceSizeBytes = sourceSize
+        item.quality = defaultQuality
         modelContext.insert(item)
         save()
         reload()
@@ -208,7 +214,7 @@ final class QueueStore {
         // @Sendable onProgress-Closure gefangen werden. Stattdessen die Sendable
         // UUID fangen und das Item auf dem MainActor ueber die items-Liste finden.
         let progressItemID = item.id
-        let quality = item.encodeSettings?.quality ?? defaultQuality
+        let quality = item.quality
         let onProgress: @Sendable (Double) -> Void = { [weak self] pct in
             Task { @MainActor in
                 self?.items.first(where: { $0.id == progressItemID })?.setProgress(pct)
@@ -353,6 +359,12 @@ final class QueueStore {
             let videoID: String
             if let existing = item.serverVideoId {
                 videoID = existing
+            } else if let existingVideo = item.newVersionOfVideoId {
+                // Neue Version eines bestehenden Videos: kein createVideo, und die
+                // Optionen des bestehenden Videos werden NICHT veraendert.
+                videoID = existingVideo
+                item.serverVideoId = existingVideo
+                save()
             } else {
                 videoID = try await apiClient.createVideo(
                     name: item.displayName,
@@ -361,7 +373,7 @@ final class QueueStore {
                 item.serverVideoId = videoID
                 save()
                 // Backend-Optionen fuer das neue Video setzen (best effort, blockiert
-                // den Upload nicht). Bei bestehendem Video (neue Version) NICHT anfassen.
+                // den Upload nicht).
                 _ = try? await apiClient.updateVideo(
                     videoID: videoID,
                     downloadsEnabled: defaultDownloadsEnabled,
