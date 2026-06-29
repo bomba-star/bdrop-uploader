@@ -27,8 +27,36 @@ struct ContentView: View {
             } else {
                 QueueListView()
             }
+
+            if let msg = queue.lastStatusMessage {
+                statusBar(msg)
+            }
         }
         .frame(minWidth: 720, minHeight: 480)
+    }
+
+    // MARK: - Statusleiste (z.B. "Review-Link kopiert")
+
+    private func statusBar(_ message: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "info.circle")
+                .foregroundStyle(.secondary)
+            Text(message)
+                .font(.subheadline)
+                .lineLimit(2)
+                .textSelection(.enabled)
+            Spacer()
+            Button {
+                queue.lastStatusMessage = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .help("Ausblenden")
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(.thinMaterial)
     }
 
     // MARK: - Token-Banner (401)

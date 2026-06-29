@@ -107,6 +107,26 @@ struct QueueRowView: View {
                 .labelStyle(.iconOnly)
             }
 
+            if item.outputPath != nil && (item.status == .done || item.target.isLocal) {
+                Button {
+                    queue.revealInFinder(item)
+                } label: {
+                    Label("Im Finder zeigen", systemImage: "folder")
+                }
+                .help("Im Finder zeigen")
+                .labelStyle(.iconOnly)
+            }
+
+            if item.status == .done && !item.target.isLocal && item.serverVideoId != nil {
+                Button {
+                    Task { await queue.createAndCopyReviewLink(item) }
+                } label: {
+                    Label("Review-Link kopieren", systemImage: "link")
+                }
+                .help("Review-Link erstellen und in die Zwischenablage kopieren")
+                .labelStyle(.iconOnly)
+            }
+
             Button(role: .destructive) {
                 queue.remove(item)
             } label: {

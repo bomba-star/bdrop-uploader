@@ -463,6 +463,36 @@ final class QueueStore {
         save(); reload()
     }
 
+    /// Zeigt die Ausgabe (Datei oder HLS-Ordner) im Finder.
+    func revealInFinder(_ item: QueueItem) {
+        guard let path = item.outputPath else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// Legt einen Review-Link zum fertigen Video an und kopiert ihn in die Zwischenablage.
+    func createAndCopyReviewLink(_ item: QueueItem) async {
+        guard let videoID = item.serverVideoId else {
+            lastStatusMessage = "Kein Server-Video vorhanden - bitte erst hochladen."
+            return
+        }
+        do {
+            let link = try await apiClient.createVideoLink(videoID: videoID, options: LinkOptions())
+            let url = Self.reviewURL(from: link)
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(url, forType: .string)
+            lastStatusMessage = "Review-Link kopiert: \(url)"
+        } catch {
+            lastStatusMessage = "Review-Link fehlgeschlagen: \(error.localizedDescription)"
+        }
+    }
+
+    /// Baut die Review-URL aus der Server-Antwort (bevorzugt url, sonst /review/<token>).
+    private static func reviewURL(from link: LinkOut) -> String {
+        if let u = link.url, !u.isEmpty { return u }
+        return "https://jonasbomba.com/review/\(link.token ?? "")"
+    }
+
     // MARK: - Token / Fehler (PLAN.md Abschnitt 9)
 
     private func handleUnauthorized() {
