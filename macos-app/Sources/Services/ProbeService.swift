@@ -18,6 +18,8 @@ struct ProbeResult: Sendable {
     var height: Int
     var durationSeconds: Double
     var hasAudio: Bool
+    /// Codec des ersten Audio-Streams (z.B. "aac", "pcm_s16le"); nil wenn kein Audio.
+    var audioCodec: String?
     /// Roher ffprobe-JSON (wird im QueueItem persistiert).
     var rawJSON: String
 
@@ -75,7 +77,7 @@ struct ProbeService: Sendable {
         if Self.rejectExtensions.contains(ext) {
             return ProbeResult(
                 codec: ext, pixelFormat: "", bitDepth: 0, width: 0, height: 0,
-                durationSeconds: 0, hasAudio: false, rawJSON: "",
+                durationSeconds: 0, hasAudio: false, audioCodec: nil, rawJSON: "",
                 classification: .reject(reason: "Format \(ext.uppercased()) wird nicht unterstützt (RAW/Bild)."))
         }
 
@@ -109,6 +111,8 @@ struct ProbeService: Sendable {
         let width = video.width ?? 0
         let height = video.height ?? 0
         let hasAudio = probe.streams.contains { $0.codec_type == "audio" }
+        // Codec des ersten Audio-Streams (fuer die smartRemux-Audio-Entscheidung).
+        let audioCodec = probe.streams.first(where: { $0.codec_type == "audio" })?.codec_name
 
         // Dauer: zuerst format.duration, sonst stream.duration.
         let duration = Double(probe.format?.duration ?? video.duration ?? "0") ?? 0
@@ -124,6 +128,7 @@ struct ProbeService: Sendable {
             height: height,
             durationSeconds: duration,
             hasAudio: hasAudio,
+            audioCodec: audioCodec,
             rawJSON: stdout,
             classification: classification)
     }

@@ -219,8 +219,12 @@ final class QueueStore {
 
         // Smart-Thumbnail (Poster-Frame, best effort, blockiert die Pipeline nicht).
         let thumbAt = min(max(probe.durationSeconds * 0.1, 1.0), max(probe.durationSeconds - 0.5, 1.0))
-        if let thumb = await encodeService.generateThumbnail(
-            input: url, scratchDir: scratchDir, itemID: item.id, atSeconds: thumbAt) {
+        let thumb = await encodeService.generateThumbnail(
+            input: url, scratchDir: scratchDir, itemID: item.id, atSeconds: thumbAt)
+        // Use-after-delete-Schutz: Item koennte waehrend des Thumbnail-Laufs entfernt
+        // worden sein -> nicht weiter mutieren (Fix 13). Der defer gibt den Slot frei.
+        guard items.contains(where: { $0.id == item.id }) else { return }
+        if let thumb {
             item.thumbnailPath = thumb.path
             save(); reload()
         }
@@ -230,6 +234,9 @@ final class QueueStore {
         // UUID fangen und das Item auf dem MainActor ueber die items-Liste finden.
         let progressItemID = item.id
         let quality = item.quality
+        // target einfrieren: das Item koennte zwischen den awaits editiert werden;
+        // Routing-Entscheidungen muessen auf einem stabilen Wert beruhen (Fix 14).
+        let target = item.target
         let onProgress: @Sendable (Double) -> Void = { [weak self] pct in
             Task { @MainActor in
                 self?.items.first(where: { $0.id == progressItemID })?.setProgress(pct)
@@ -237,7 +244,7 @@ final class QueueStore {
         }
 
         // === HLS-Leiter (Ziel B: r2HLS oder lokaler HLS-Export). Immer Neu-Encode. ===
-        if item.target.producesHLS {
+        if target.producesHLS {
             let settings = EncodeSettings(
                 plan: .hlsLadder, quality: quality, sourceWasCompatible: false, videoTag: "avc1")
             item.encodeSettings = settings
@@ -254,16 +261,20 @@ final class QueueStore {
                     hasAudio: probe.hasAudio,
                     maxWidth: quality.hlsMaxWidth,
                     onProgress: onProgress)
+                // Use-after-delete-Schutz nach dem Encode-await (Fix 13).
+                guard items.contains(where: { $0.id == item.id }) else { return }
                 item.outputPath = outDir.path
-                if item.target.isLocal {
+                if target.isLocal {
                     finishLocalExport(item, from: outDir, isDirectory: true)
                 } else {
-                    // r2HLS: geparkt bei .encoded (R2-Upload folgt).
-                    item.status = .encoded
-                    item.setProgress(1)
+                    // r2HLS: lokal erzeugt, aber der R2-Upload ist noch nicht
+                    // freigeschaltet (Track B) - ehrlich als fehlgeschlagen markieren (Fix 17).
+                    item.markFailed("4K-HLS lokal erzeugt - der R2-Upload ist noch nicht freigeschaltet (Track B).")
                 }
                 save(); reload()
             } catch EncodeError.cancelled {
+                // .cancelled tritt nur via remove() auf (Item wird geloescht) (Fix 13/18).
+                guard items.contains(where: { $0.id == item.id }) else { return }
                 item.status = .queued; item.setProgress(0); save(); reload()
             } catch {
                 item.markFailed(error.localizedDescription); save(); reload()
@@ -286,9 +297,11 @@ final class QueueStore {
                 durationSeconds: probe.durationSeconds,
                 settings: settings,
                 onProgress: onProgress)
+            // Use-after-delete-Schutz nach dem Encode-await (Fix 13).
+            guard items.contains(where: { $0.id == item.id }) else { return }
             item.outputPath = result.outputURL.path
             item.encodeSettings = result.appliedSettings  // ggf. VideoToolbox-Fallback
-            if item.target.isLocal {
+            if target.isLocal {
                 finishLocalExport(item, from: result.outputURL, isDirectory: false)
             } else {
                 item.status = .encoded
@@ -296,6 +309,8 @@ final class QueueStore {
             }
             save(); reload()
         } catch EncodeError.cancelled {
+            // .cancelled tritt nur via remove() auf (Item wird geloescht) (Fix 13/18).
+            guard items.contains(where: { $0.id == item.id }) else { return }
             item.status = .queued
             item.setProgress(0)
             save(); reload()
@@ -398,6 +413,12 @@ final class QueueStore {
                     versionSwitcherEnabled: defaultVersionSwitcher)
             }
 
+            // Use-after-delete-Schutz: Item koennte waehrend der createVideo/updateVideo
+            // -awaits entfernt worden sein -> Slot freigeben und aussteigen (Fix 13).
+            guard items.contains(where: { $0.id == item.id }) else {
+                finishUploadSlot(); return
+            }
+
             // Idempotenz: wenn schon eine version_id existiert, NICHT erneut hochladen,
             // sondern direkt cf-refresh pollen (PLAN.md Abschnitt 8).
             if let versionID = item.serverVersionId {
@@ -437,6 +458,9 @@ final class QueueStore {
         item.status = .serverProcessing
         save(); reload()
         let ready = try await uploadService.pollCFRefresh(versionID: versionID)
+        // Use-after-delete-Schutz: Item koennte waehrend des Pollings entfernt worden
+        // sein -> nicht weiter mutieren (Fix 13).
+        guard items.contains(where: { $0.id == item.id }) else { return }
         if ready {
             item.status = .done
             item.setProgress(1)
@@ -468,7 +492,11 @@ final class QueueStore {
         guard item.status.isRetryable else { return }
         item.lastError = nil
         item.retryCount += 1
-        if item.serverVersionId != nil {
+        // Lokale Konvertierungen und r2HLS haben keine Upload-Idempotenz-Klammer und
+        // muessen komplett neu durch die Encode-Stufe, statt in einer Sackgasse zu enden (Fix 16).
+        if item.target.isLocal || item.target == .r2HLS {
+            item.status = .queued
+        } else if item.serverVersionId != nil {
             item.status = .encoded // -> Upload-Stufe erkennt version_id und pollt nur
         } else if item.outputPath != nil, FileManager.default.fileExists(atPath: item.outputPath!) {
             item.status = .encoded
@@ -487,6 +515,11 @@ final class QueueStore {
 
     /// Entfernt ein Item samt Scratch-Output.
     func remove(_ item: QueueItem) {
+        // Laufende Arbeit stoppen, bevor das Item geloescht wird (Fix 18).
+        uploadService.cancelTask(itemID: item.id)
+        if item.status == .encoding || item.status == .probing {
+            Task { await encodeService.cancel() }
+        }
         if let path = item.outputPath {
             try? FileManager.default.removeItem(atPath: path)
         }
@@ -593,6 +626,7 @@ final class QueueStore {
                     Task { @MainActor in
                         do { try await self.verify(item: item, versionID: versionID) }
                         catch { self.handleUploadError(item: item, error: error) }
+                        self.pumpPipeline()
                     }
                 } else if attachedIDs.contains(item.id) {
                     // Transfer laeuft noch im Daemon -> nichts tun, Delegate uebernimmt.
@@ -608,6 +642,7 @@ final class QueueStore {
                     Task { @MainActor in
                         do { try await self.verify(item: item, versionID: versionID) }
                         catch { self.handleUploadError(item: item, error: error) }
+                        self.pumpPipeline()
                     }
                 }
 
@@ -616,6 +651,9 @@ final class QueueStore {
             }
         }
         save(); reload()
+        // Aktive Upload-Slots an die tatsaechlich noch im Daemon laufenden Transfers
+        // angleichen, damit die Slot-Buchhaltung nach dem Neustart stimmt (Fix 15a).
+        activeUploads = items.filter { $0.status == .uploading && attachedIDs.contains($0.id) }.count
         pumpPipeline()
     }
 
@@ -660,7 +698,7 @@ extension QueueStore: UploadServiceDelegate {
 
     nonisolated func upload(itemID: UUID, didFinishWithResponseBody body: Data, httpStatus: Int) {
         Task { @MainActor in
-            guard let item = self.items.first(where: { $0.id == itemID }) else { return }
+            guard let item = self.items.first(where: { $0.id == itemID }) else { self.finishUploadSlot(); return }
             do {
                 let versionID = try self.apiClient.parseVersionID(from: body)
                 item.serverVersionId = versionID  // Idempotenz-Klammer sofort sichern
@@ -675,7 +713,7 @@ extension QueueStore: UploadServiceDelegate {
 
     nonisolated func upload(itemID: UUID, didFailWith error: Error) {
         Task { @MainActor in
-            guard let item = self.items.first(where: { $0.id == itemID }) else { return }
+            guard let item = self.items.first(where: { $0.id == itemID }) else { self.finishUploadSlot(); return }
             self.handleUploadError(item: item, error: error)
             self.finishUploadSlot()
         }

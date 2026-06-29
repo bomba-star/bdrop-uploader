@@ -40,17 +40,22 @@ struct EncodeSettings: Codable, Sendable, Equatable {
     var sourceWasCompatible: Bool
     /// Video-Tag: avc1 fuer H.264, hvc1 fuer HEVC-Durchreichen (PLAN.md Abschnitt 5).
     var videoTag: String
+    /// Ob der Audio-Stream der Quelle nicht MP4-nativ ist und beim Remux nach AAC
+    /// umcodiert werden muss (PLAN.md Abschnitt 5: smartRemux-Audio-Sicherheit).
+    var audioNeedsTranscode: Bool
 
     init(
         plan: EncodePlan,
         quality: EncodeQuality,
         sourceWasCompatible: Bool,
-        videoTag: String = "avc1"
+        videoTag: String = "avc1",
+        audioNeedsTranscode: Bool = false
     ) {
         self.plan = plan
         self.quality = quality
         self.sourceWasCompatible = sourceWasCompatible
         self.videoTag = videoTag
+        self.audioNeedsTranscode = audioNeedsTranscode
     }
 
     /// JSON-Repraesentation fuer die Persistenz.

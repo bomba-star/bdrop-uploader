@@ -45,6 +45,10 @@ enum EncodeError: LocalizedError {
 actor EncodeService {
 
     private var currentProcess: Process?
+    /// Vom Cancel gesetzt: unterscheidet einen gewollten Abbruch von echten Fehlern.
+    /// ffmpeg faengt SIGTERM ab und endet teils mit Code 1 (nicht 15) - deshalb
+    /// reicht die Signal-Code-Pruefung allein nicht aus (Fix 1).
+    private var cancelRequested = false
 
     // MARK: - Plan-Auswahl
 
@@ -55,21 +59,27 @@ actor EncodeService {
             if case .compatible = probe.classification { return true }
             return false
         }()
+        // MP4-native Audio-Codecs koennen ohne Neucodierung in den MP4-Container.
+        // Alles andere (z.B. pcm_*, opus, vorbis, dts) muss beim Remux nach AAC (Fix 9).
+        let mp4NativeAudio: Set<String> = ["aac", "ac3", "eac3", "mp3", "alac"]
+        let audioTranscode = probe.audioCodec.map { !mp4NativeAudio.contains($0.lowercased()) } ?? false
         // Smart-Remux nur, wenn die Quelle tauglich ist UND die Stufe keine
         // Skalierung verlangt (z.B. 4K-Master). Sonst echter Encode mit Cap.
         if compatible && quality.allowRemux {
             let tag = probe.codec == "hevc" ? "hvc1" : "avc1"
-            return EncodeSettings(plan: .smartRemux, quality: quality, sourceWasCompatible: true, videoTag: tag)
+            return EncodeSettings(plan: .smartRemux, quality: quality, sourceWasCompatible: true, videoTag: tag, audioNeedsTranscode: audioTranscode)
         }
         let plan: EncodePlan = quality.usesHardware ? .hardwareH264 : .softwareX264
-        return EncodeSettings(plan: plan, quality: quality, sourceWasCompatible: compatible, videoTag: "avc1")
+        return EncodeSettings(plan: plan, quality: quality, sourceWasCompatible: compatible, videoTag: "avc1", audioNeedsTranscode: audioTranscode)
     }
 
     /// Liefert das -vf-Scale-Argument fuer die Aufloesungs-Obergrenze der Stufe.
     /// Skaliert nur herunter (min(maxW,iw)), nie hoch. Leer, wenn keine Grenze.
     private static func scaleArgs(for quality: EncodeQuality) -> [String] {
         guard let w = quality.maxWidth else { return [] }
-        return ["-vf", "scale='min(\(w),iw)':-2:flags=lanczos"]
+        // Breite auf gerade Zahl abrunden (trunc(.../2)*2), sonst scheitern manche
+        // Encoder / yuv420p an ungerader Breite (Fix 5).
+        return ["-vf", "scale='trunc(min(\(w),iw)/2)*2':-2:flags=lanczos"]
     }
 
     // MARK: - ffmpeg-Argumente (PLAN.md Abschnitt 5)
@@ -83,8 +93,15 @@ actor EncodeService {
         switch settings.plan {
         case .smartRemux:
             // Schneller Faststart-Remux ohne Generationsverlust (PLAN.md Abschnitt 5).
+            // Video immer kopieren; Audio nur kopieren, wenn es MP4-nativ ist, sonst
+            // nach AAC umcodieren - `-c copy` wuerde inkompatibles Audio mitschleppen (Fix 6).
+            let audioArgs = settings.audioNeedsTranscode
+                ? ["-c:a", "aac", "-b:a", AppConfig.audioBitrate]
+                : ["-c:a", "copy"]
             return ["-i", input.path]
-                + ["-c", "copy", "-movflags", "+faststart"]
+                + ["-c:v", "copy"]
+                + audioArgs
+                + ["-movflags", "+faststart"]
                 + ["-tag:v", settings.videoTag]
                 + progress
                 + [output.path]
@@ -114,8 +131,8 @@ actor EncodeService {
                 + [output.path]
 
         case .hlsLadder:
-            // TODO(Ziel B): aspektgenaue HLS-Ladder gemaess PLAN.md Abschnitt 6.
-            // Noch nicht implementiert. Siehe HLSLadderBuilder.swift (Platzhalter).
+            // HLS laeuft ueber encodeHLS()/HLSLadderBuilder, nicht ueber arguments() (Fix 4).
+            assertionFailure("hlsLadder nutzt encodeHLS, nicht arguments()")
             return []
         }
     }
@@ -193,6 +210,7 @@ actor EncodeService {
         durationSeconds: Double,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
+        cancelRequested = false
         let ffmpeg = try FFmpegLocator.ffmpegURL()
 
         let process = Process()
@@ -208,14 +226,17 @@ actor EncodeService {
 
         // stderr im Hintergrund einsammeln (fuer den Fehler-Tail).
         let stderrActor = StderrCollector()
+
+        try process.run()
+
+        // Handler ERST nach erfolgreichem run() setzen, sonst bleibt bei einem
+        // run()-Throw ein readabilityHandler am FileHandle haengen (Fix 3).
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if !data.isEmpty, let s = String(data: data, encoding: .utf8) {
                 Task { await stderrActor.append(s) }
             }
         }
-
-        try process.run()
 
         // stdout zeilenweise lesen und out_time_us extrahieren.
         // ffmpeg schreibt -progress als key=value-Bloecke, getrennt durch
@@ -226,6 +247,13 @@ actor EncodeService {
         process.waitUntilExit()
         stderrPipe.fileHandleForReading.readabilityHandler = nil
         currentProcess = nil
+
+        // Cancel hat Vorrang: ffmpeg faengt SIGTERM ab und endet teils mit Code 1,
+        // deshalb am gemerkten Cancel-Wunsch festmachen, nicht nur am Signal (Fix 1).
+        if cancelRequested {
+            cancelRequested = false
+            throw EncodeError.cancelled
+        }
 
         let code = process.terminationStatus
         if code != 0 {
@@ -283,33 +311,44 @@ actor EncodeService {
     // MARK: - Smart-Thumbnail (Poster-Frame)
 
     /// Extrahiert einen einzelnen Frame als JPG (Poster). Best effort: liefert nil,
-    /// wenn ffmpeg fehlt oder der Frame nicht erzeugt werden konnte. Laeuft im
-    /// Aktor (nicht auf dem MainActor), darf also kurz blockieren.
-    func generateThumbnail(input: URL, scratchDir: URL, itemID: UUID, atSeconds: Double) -> URL? {
+    /// wenn ffmpeg fehlt oder der Frame nicht erzeugt werden konnte. Der blockierende
+    /// ffmpeg-Lauf wird auf eine Hintergrund-Queue ausgelagert, damit der Aktor-Thread
+    /// waehrend waitUntilExit() nicht blockiert (Fix 2).
+    func generateThumbnail(input: URL, scratchDir: URL, itemID: UUID, atSeconds: Double) async -> URL? {
         guard let ffmpeg = try? FFmpegLocator.ffmpegURL() else { return nil }
         try? FileManager.default.createDirectory(at: scratchDir, withIntermediateDirectories: true)
         let out = scratchDir.appendingPathComponent("\(itemID.uuidString)-thumb.jpg")
         try? FileManager.default.removeItem(at: out)
 
-        let process = Process()
-        process.executableURL = ffmpeg
-        process.arguments = [
+        let args = [
             "-ss", String(format: "%.2f", max(0, atSeconds)),
             "-i", input.path,
             "-frames:v", "1",
             "-vf", "scale=480:-2",
             "-y", out.path,
         ]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return nil
+
+        // Den blockierenden Prozess auf eine Utility-Queue auslagern; der Aktor gibt
+        // seinen Thread waehrend des await frei (Fix 2). Alle gefangenen Werte
+        // (ffmpeg, args, out) sind Sendable.
+        return await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                let process = Process()
+                process.executableURL = ffmpeg
+                process.arguments = args
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                } catch {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let ok = process.terminationStatus == 0 && FileManager.default.fileExists(atPath: out.path)
+                continuation.resume(returning: ok ? out : nil)
+            }
         }
-        let ok = process.terminationStatus == 0 && FileManager.default.fileExists(atPath: out.path)
-        return ok ? out : nil
     }
 
     // MARK: - Pause / Resume / Cancel
@@ -328,6 +367,7 @@ actor EncodeService {
 
     /// Harter Abbruch (Item geht zurueck auf queued, Teil-Output wird verworfen).
     func cancel() {
+        cancelRequested = true
         currentProcess?.terminate()
     }
 }

@@ -98,6 +98,15 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
         return ids
     }
 
+    /// Bricht einen laufenden Background-Upload-Task fuer das gegebene Item ab.
+    func cancelTask(itemID: UUID) {
+        session.getAllTasks { tasks in
+            for task in tasks where task.taskDescription == itemID.uuidString {
+                task.cancel()
+            }
+        }
+    }
+
     // MARK: - cf-refresh-Polling mit Backoff (PLAN.md Abschnitt 7, Schritt 3)
 
     /// Pollt cf-refresh mit Exponential-Backoff bis ready_to_stream, error oder Timeout.

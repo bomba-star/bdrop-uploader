@@ -54,7 +54,8 @@ struct VersionResponse: Decodable, Sendable {
     var version_id: String?
     var id: String?
     /// Liefert die Version-ID egal unter welchem Feldnamen der Server sie schickt.
-    var resolvedVersionID: String? { version_id ?? id }
+    /// `id` ist autoritativ und hat Vorrang vor dem aelteren `version_id`-Feld.
+    var resolvedVersionID: String? { id ?? version_id }
 }
 
 /// Antwort von cf-refresh. Verifiziert gegen Live-Code: Server liefert
@@ -135,7 +136,7 @@ struct VideoSummaryDTO: Decodable, Identifiable, Sendable, Hashable {
 
 /// Envelope fuer GET /api/admin/projects/{id} (nur die videos-Liste interessiert hier).
 private struct ProjectDetailEnvelope: Decodable {
-    var videos: [VideoSummaryDTO]?
+    var videos: [VideoSummaryDTO]
 }
 
 // MARK: - Fehler
@@ -211,7 +212,7 @@ struct ApiClient: Sendable {
     func listVideos(projectID: String) async throws -> [VideoSummaryDTO] {
         let req = try makeRequest(path: "\(AppConfig.adminPath)/projects/\(projectID)", method: "GET")
         let envelope: ProjectDetailEnvelope = try await sendDecoding(req)
-        return envelope.videos ?? []
+        return envelope.videos
     }
 
     // MARK: - Video anlegen (PLAN.md Abschnitt 7, Schritt 1)
