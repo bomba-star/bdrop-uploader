@@ -1,8 +1,10 @@
-name: macOS Build (Compile Smoke Test)
+name: macOS Build (App-Artifact)
 
-# Reiner Kompilier-Test des Swift-Skeletts auf einem gehosteten macOS-Runner.
-# Signing/Notarisierung bewusst AUS - es geht nur darum, die Compile-Fehler
-# des nie-gebauten Codes sichtbar zu machen und iterativ abzuraeumen.
+# Baut die App auf einem gehosteten macOS-Runner (Debug, unsigniert), buendelt
+# best-effort statisches ffmpeg und laedt die fertige .app als Artifact hoch.
+# Signing/Notarisierung bewusst AUS. Die .app ist mit lokal installiertem ffmpeg
+# (Homebrew) sofort lauffaehig; nach dem Download ggf. Gatekeeper-Quarantaene
+# entfernen: xattr -dr com.apple.quarantine BDropUploader.app
 # Manuell ausloesbar (workflow_dispatch) und bei Push auf macos-app/**.
 
 on:
@@ -34,13 +36,25 @@ jobs:
       - name: XcodeGen + xcbeautify installieren
         run: brew install xcodegen xcbeautify
 
-      - name: ffmpeg-Resource-Ordner sicherstellen
+      - name: ffmpeg statisch buendeln (best effort)
+        continue-on-error: true
         run: |
-          # Echte ffmpeg/ffprobe-Binaries sind gitignored und fuer den reinen
-          # Compile nicht noetig (zur Laufzeit ueber FFmpegLocator aufgeloest).
-          # Der Resource-Ordner muss aber existieren, damit XcodeGen ihn findet.
+          # Statische arm64-Builds ins Bundle legen, damit die App ohne Homebrew
+          # umwandelt. Best effort: schlaegt der Download fehl, baut die App
+          # trotzdem (FFmpegLocator faellt zur Laufzeit auf Homebrew zurueck).
+          set -e
           mkdir -p Resources/ffmpeg
+          base="https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release"
+          curl -fsSL "$base/ffmpeg.zip"  -o /tmp/ffmpeg.zip
+          curl -fsSL "$base/ffprobe.zip" -o /tmp/ffprobe.zip
+          unzip -o /tmp/ffmpeg.zip  -d Resources/ffmpeg
+          unzip -o /tmp/ffprobe.zip -d Resources/ffmpeg
+          chmod +x Resources/ffmpeg/ffmpeg Resources/ffmpeg/ffprobe
+          Resources/ffmpeg/ffmpeg -version | head -1
           ls -la Resources/ffmpeg
+
+      - name: ffmpeg-Resource-Ordner sicherstellen
+        run: mkdir -p Resources/ffmpeg && ls -la Resources/ffmpeg
 
       - name: Xcode-Projekt aus project.yml generieren
         run: xcodegen generate
@@ -57,6 +71,7 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             ENABLE_HARDENED_RUNTIME=NO \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
             build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | xcbeautify
 
       - name: Compiler-Fehler zusammenfassen
@@ -74,4 +89,25 @@ jobs:
         with:
           name: xcodebuild-log
           path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: warn
+
+      - name: App packen (unsigniert)
+        if: success()
+        run: |
+          APP="$RUNNER_TEMP/dd/Build/Products/Debug/BDropUploader.app"
+          if [ -d "$APP" ]; then
+            ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/BDropUploader.app.zip"
+            echo "App gepackt: $APP"
+          else
+            echo "App nicht gefunden unter $APP"
+            ls -R "$RUNNER_TEMP/dd/Build/Products" || true
+            exit 1
+          fi
+
+      - name: App-Artifact hochladen (unsigniert, lauffaehig mit lokalem ffmpeg)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BDropUploader-app
+          path: ${{ runner.temp }}/BDropUploader.app.zip
           if-no-files-found: warn
