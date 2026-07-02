@@ -62,6 +62,14 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
         mapLock.unlock()
     }
 
+    /// Synchroner Snapshot der gesehenen Item-IDs. Eigene sync-Funktion, weil
+    /// Swift 6 lock()/unlock() direkt in async-Kontexten verbietet.
+    private func seenSnapshot() -> Set<UUID> {
+        mapLock.lock()
+        defer { mapLock.unlock() }
+        return seenItemIDs
+    }
+
     /// Completion-Handler, den AppKit beim Background-Wake uebergibt (Re-Attach).
     var backgroundCompletionHandler: (() -> Void)?
 
@@ -111,9 +119,7 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
     /// .encoded zurueckfallen (Duplikat-Version, Fix H4).
     func reattachTasks() async -> [UUID] {
         let tasks = await session.allTasks
-        mapLock.lock()
-        var ids = seenItemIDs
-        mapLock.unlock()
+        var ids = seenSnapshot()
         for task in tasks {
             if let desc = task.taskDescription, let id = UUID(uuidString: desc) {
                 ids.insert(id)
