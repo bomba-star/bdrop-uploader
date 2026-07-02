@@ -35,6 +35,7 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
         config.sessionSendsLaunchEvents = true
         config.allowsCellularAccess = true
         config.httpMaximumConnectionsPerHost = AppConfig.uploadConcurrency
+        config.timeoutIntervalForRequest = AppConfig.uploadRequestTimeout // Netz-Haenger ueberleben (H5)
         config.timeoutIntervalForResource = 60 * 60 * 12 // 12h: grosse Filme + Hintergrund
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
@@ -162,7 +163,8 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
             delegate?.upload(itemID: id, didFailWith: error)
             return
         }
-        let status = (task.response as? HTTPURLResponse)?.statusCode ?? 0
+        let http = task.response as? HTTPURLResponse
+        let status = http?.statusCode ?? 0
         // 401/429/503 als Fehler weiterreichen, alles 2xx als Erfolg.
         if (200..<300).contains(status) {
             delegate?.upload(itemID: id, didFinishWithResponseBody: body, httpStatus: status)
@@ -170,7 +172,11 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
             let apiErr: Error
             switch status {
             case 401: apiErr = ApiError.unauthorized
-            case 429: apiErr = ApiError.rateLimited(retryAfter: nil)
+            case 429:
+                // Echten Retry-After-Wert durchreichen statt hart nil;
+                // value(forHTTPHeaderField:) liest case-insensitiv (Fix K6).
+                let retryAfterHeader = http?.value(forHTTPHeaderField: "Retry-After")
+                apiErr = ApiError.rateLimited(retryAfter: retryAfterHeader.flatMap(TimeInterval.init))
             case 503: apiErr = ApiError.serviceUnavailable
             default:
                 let text = String(data: body, encoding: .utf8) ?? ""

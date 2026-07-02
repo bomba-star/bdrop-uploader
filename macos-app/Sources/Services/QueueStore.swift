@@ -65,6 +65,10 @@ final class QueueStore {
     private var encodeSlotBusy = false
     /// Zaehlt aktive Uploads gegen AppConfig.uploadConcurrency.
     private var activeUploads = 0
+    /// Fruehester naechster Upload-Versuch pro Item (Backoff bei transienten
+    /// Fehlern, Fix K6). Bewusst nur in-memory: nach einem App-Neustart darf
+    /// sofort erneut versucht werden.
+    private var nextRetryAt: [UUID: Date] = [:]
 
     /// Scratch-Ordner fuer encodierte Master (NICHT in ~/sync).
     private let scratchDir: URL
@@ -161,8 +165,16 @@ final class QueueStore {
         }
 
         // 2) Upload-Slots: encodierte Items hochladen (1-2 parallel).
+        // Items, deren Backoff-Zeitpunkt noch nicht erreicht ist, werden
+        // uebersprungen; scheduleRetry pumpt nach Ablauf erneut (Fix K6).
+        let now = Date()
         while activeUploads < AppConfig.uploadConcurrency,
-              let next = items.first(where: { $0.status == .encoded && $0.target == .cfStream }) {
+              let next = items.first(where: { item in
+                  guard item.status == .encoded && item.target == .cfStream else { return false }
+                  if let earliest = nextRetryAt[item.id], earliest > now { return false }
+                  return true
+              }) {
+            nextRetryAt.removeValue(forKey: next.id)
             activeUploads += 1
             // Status sofort umsetzen, damit dieselbe Schleife es nicht erneut greift.
             next.status = .uploading
@@ -543,6 +555,24 @@ final class QueueStore {
                 finishUploadSlot(); reload(); return
             }
 
+            // Groessen-Gate vor dem Stream-Upload: der r2-stream-Pfad ist serverseitig
+            // gedeckelt (413 nach Stunden). Der Multipart-Fallback ist nur ein Stub,
+            // deshalb hier terminal fehlschlagen statt sinnlos hochzuladen (Fix K5).
+            let uploadBytes: Int64? = {
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+                   let size = attrs[.size] as? Int64 {
+                    return size
+                }
+                return item.sourceSizeBytes
+            }()
+            if let bytes = uploadBytes, bytes > AppConfig.r2StreamMaxBytes {
+                let sizeText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+                let limitText = ByteCountFormatter.string(fromByteCount: AppConfig.r2StreamMaxBytes, countStyle: .file)
+                item.markFailed("Datei zu groß für den Upload (\(sizeText), Limit \(limitText)). Multipart-Upload ist noch nicht implementiert.")
+                notifyTerminal(item, success: false)
+                finishUploadSlot(); save(); reload(); return
+            }
+
             // r2-stream-Upload starten (Background-Session). Die version_id kommt
             // im didFinish-Callback zurueck, der die Verify-Phase ausloest.
             item.status = .uploading
@@ -550,7 +580,10 @@ final class QueueStore {
             save(); reload()
 
             let contentType = "video/mp4"
-            let maxDuration = Int((item.durationSeconds ?? 0).rounded(.up))
+            // etwas Puffer (CF-Dauer kann minimal abweichen), analog zur Python-
+            // Referenz engine/bdrop_encode/upload.py derive_max_duration (H6).
+            // Den 6h-Server-Cap deckelt r2StreamRequest.
+            let maxDuration = Int((item.durationSeconds ?? 0).rounded(.up)) + 5
             try uploadService.startStreamUpload(
                 itemID: item.id,
                 videoID: videoID,
@@ -609,6 +642,8 @@ final class QueueStore {
         guard item.status.isRetryable else { return }
         item.lastError = nil
         item.retryCount += 1
+        // Manueller Retry umgeht einen evtl. laufenden Backoff (Fix K6).
+        nextRetryAt.removeValue(forKey: item.id)
         // Lokale Konvertierungen und r2HLS haben keine Upload-Idempotenz-Klammer und
         // muessen komplett neu durch die Encode-Stufe, statt in einer Sackgasse zu enden (Fix 16).
         if item.target.isLocal || item.target == .r2HLS {
@@ -640,6 +675,8 @@ final class QueueStore {
         if let path = item.outputPath {
             try? FileManager.default.removeItem(atPath: path)
         }
+        // Evtl. gemerkten Backoff-Eintrag mit entsorgen (Fix K6).
+        nextRetryAt.removeValue(forKey: item.id)
         modelContext.delete(item)
         save(); reload()
     }
@@ -699,10 +736,12 @@ final class QueueStore {
                 handleUnauthorized()
                 item.status = .encoded
             case .rateLimited, .serviceUnavailable, .transport:
-                // Transient: zurueck auf encoded fuer automatischen Re-Pump.
+                // Transient: zurueck auf encoded, aber mit Backoff statt sofortigem
+                // Re-Pump - sonst verbrennen alle Retries in derselben Sekunde (Fix K6).
                 if item.retryCount < AppConfig.maxRetries {
                     item.retryCount += 1
                     item.status = .encoded
+                    scheduleRetry(for: item.id, after: Self.retryDelay(for: api, attempt: item.retryCount))
                 } else {
                     item.markFailed(api.localizedDescription)
                 }
@@ -714,6 +753,43 @@ final class QueueStore {
         }
         if item.status == .failed { notifyTerminal(item, success: false) }
         save(); reload()
+    }
+
+    /// Liefert die Backoff-Wartezeit: Retry-After vom Server falls vorhanden,
+    /// sonst exponentiell nach Versuchszahl (5s, 30s, 120s) (Fix K6).
+    private static func retryDelay(for error: ApiError, attempt: Int) -> TimeInterval {
+        // Server-Wert klemmen: ein unsauberer Retry-After-Header (inf, absoluter
+        // Timestamp) darf nie ungeprueft in die Sleep-Berechnung laufen.
+        if case .rateLimited(let retryAfter) = error, let retryAfter,
+           retryAfter.isFinite, retryAfter > 0 {
+            return min(retryAfter, 300)
+        }
+        switch attempt {
+        case 1:  return 5
+        case 2:  return 30
+        default: return 120
+        }
+    }
+
+    /// Merkt den fruehesten naechsten Versuch fuer ein Item und stoesst die
+    /// Pipeline nach Ablauf des Delays erneut an (Fix K6). Der Task laeuft
+    /// explizit auf dem MainActor (QueueStore-Zustand wird mutiert).
+    private func scheduleRetry(for itemID: UUID, after delay: TimeInterval) {
+        // Defensiv nochmal klemmen: UInt64-Init trapt bei nicht-endlichen oder
+        // zu grossen Werten fatal.
+        let safeDelay = delay.isFinite ? min(max(delay, 0), 300) : 5
+        nextRetryAt[itemID] = Date().addingTimeInterval(safeDelay)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(safeDelay * 1_000_000_000))
+            guard let self else { return }
+            // Item kann zwischenzeitlich entfernt worden sein (Fix 13-Muster):
+            // dann nur den Backoff-Eintrag aufraeumen, nichts pumpen.
+            guard self.items.contains(where: { $0.id == itemID }) else {
+                self.nextRetryAt.removeValue(forKey: itemID)
+                return
+            }
+            self.pumpPipeline()
+        }
     }
 
     // MARK: - Crash-Recovery beim Start (PLAN.md Abschnitt 8)

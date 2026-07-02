@@ -448,8 +448,10 @@ struct ApiClient: Sendable {
         case 401:
             throw ApiError.unauthorized
         case 429:
-            // Retry-After-Header beruecksichtigen, falls vorhanden.
-            let retryAfter = (headers["Retry-After"] as? String).flatMap(TimeInterval.init)
+            // Retry-After-Header beruecksichtigen, falls vorhanden. HTTP-Header-
+            // Namen sind case-insensitiv, der Dictionary-Zugriff auf
+            // allHeaderFields aber nicht - deshalb manuell suchen (Fix K6).
+            let retryAfter = Self.headerValue("Retry-After", in: headers).flatMap(TimeInterval.init)
             throw ApiError.rateLimited(retryAfter: retryAfter)
         case 503:
             throw ApiError.serviceUnavailable
@@ -457,5 +459,16 @@ struct ApiClient: Sendable {
             let text = String(data: body, encoding: .utf8) ?? ""
             throw ApiError.httpError(status: status, body: String(text.prefix(300)))
         }
+    }
+
+    /// Liest einen Header case-insensitiv aus einem allHeaderFields-Dictionary.
+    private static func headerValue(_ name: String, in headers: [AnyHashable: Any]) -> String? {
+        for (key, value) in headers {
+            if let keyString = key as? String,
+               keyString.caseInsensitiveCompare(name) == .orderedSame {
+                return value as? String
+            }
+        }
+        return nil
     }
 }

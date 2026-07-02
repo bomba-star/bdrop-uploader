@@ -258,9 +258,15 @@ actor EncodeService {
         let code = process.terminationStatus
         if code != 0 {
             let tail = await stderrActor.tail()
-            // SIGTERM/SIGKILL durch Cancel sauber unterscheiden.
+            // Signal-Exit (SIGTERM/SIGKILL) OHNE Nutzer-Cancel ist ein echter Fehler,
+            // z.B. ein OOM-Kill durch macOS - kein .cancelled. Nur so greift der
+            // VideoToolbox-zu-libx264-Fallback in encode(), und das Item landet nicht
+            // in einer stillen Requeue-Schleife (Fix K3). Der echte Nutzer-Cancel ist
+            // oben bereits ueber cancelRequested abgefangen.
             if code == 15 || code == 9 {
-                throw EncodeError.cancelled
+                let hint = "ffmpeg wurde vom System beendet (Exit-Code \(code))."
+                let combined = tail.isEmpty ? hint : "\(hint) \(tail)"
+                throw EncodeError.nonZeroExit(code: code, stderrTail: combined)
             }
             throw EncodeError.nonZeroExit(code: code, stderrTail: tail)
         }
@@ -366,9 +372,31 @@ actor EncodeService {
     }
 
     /// Harter Abbruch (Item geht zurueck auf queued, Teil-Output wird verworfen).
+    /// Ein per SIGSTOP pausierter Prozess bekommt SIGTERM nicht zugestellt und
+    /// bliebe im T-State haengen - deshalb vor terminate() SIGCONT senden (Fix K4).
+    /// Reagiert ffmpeg nicht binnen ~5 Sekunden, eskaliert ein Hintergrund-Task
+    /// auf SIGKILL, ohne den Aktor zu blockieren.
     func cancel() {
         cancelRequested = true
-        currentProcess?.terminate()
+        guard let process = currentProcess else { return }
+        let pid = process.processIdentifier
+        kill(pid, SIGCONT)
+        process.terminate()
+        // Eskalation: nur die Sendable-PID in den Task fangen, die Pruefung
+        // laeuft actor-isoliert in escalateKill.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            await self?.escalateKill(pid: pid)
+        }
+    }
+
+    /// SIGKILL-Eskalation nach einem Cancel: nur wenn der aktuelle Prozess noch
+    /// derselbe ist und weiterhin laeuft (sonst hat SIGTERM bereits gewirkt).
+    private func escalateKill(pid: pid_t) {
+        guard let process = currentProcess,
+              process.processIdentifier == pid,
+              process.isRunning else { return }
+        kill(pid, SIGKILL)
     }
 }
 

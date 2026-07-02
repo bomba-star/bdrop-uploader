@@ -24,6 +24,11 @@ enum AppConfig {
     /// laufender Transfer nach App-Neustart re-attached werden kann.
     static let backgroundSessionID = "com.jonasbomba.bdropuploader.upload"
 
+    /// Request-Timeout der Background-Uploads (Idle-Timer, resettet bei Daten-
+    /// Aktivitaet). Der URLSession-Default von 60 s killt grosse Uploads bei
+    /// jedem laengeren Netz-Haenger (H5).
+    static let uploadRequestTimeout: TimeInterval = 600
+
     // MARK: - Upload-Limits (PLAN.md Abschnitt 4 + 7)
 
     /// Harte serverseitige Obergrenze der Dauer: 6 Stunden (Pydantic le=21600).
