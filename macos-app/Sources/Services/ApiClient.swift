@@ -139,6 +139,63 @@ private struct ProjectDetailEnvelope: Decodable {
     var videos: [VideoSummaryDTO]
 }
 
+// MARK: - DTOs: presigned Multipart (r2-init / r2-complete / r2-abort)
+
+/// Ein presigned Part-Ziel aus r2-init (Multipart-Modus).
+/// Gespiegelt gegen r2_upload_init (routes_admin_versions.py:930-933).
+struct R2InitPartDTO: Decodable, Sendable {
+    var part_number: Int
+    var url: String
+}
+
+/// Antwort von POST /api/admin/videos/{id}/versions/r2-init.
+/// Gespiegelt gegen r2_upload_init (routes_admin_versions.py:917-958):
+/// id/video_id/version_number/r2_key/status plus mode-abhaengiger Plan.
+/// mode "single" (<= 4 GiB): put_url/content_type. mode "multipart": upload_id/
+/// part_size/num_parts/parts. Nicht-plan-relevante Felder optional (lenient).
+struct R2InitResponse: Decodable, Sendable {
+    var id: String
+    var video_id: String?
+    var version_number: Int?
+    var r2_key: String?
+    var status: String?
+    /// "single" (presigned PUT) oder "multipart" (upload_id + Part-URLs).
+    var mode: String
+    // mode == "single"
+    var put_url: String?
+    var content_type: String?
+    // mode == "multipart"
+    var upload_id: String?
+    var part_size: Int64?
+    var num_parts: Int?
+    var parts: [R2InitPartDTO]?
+}
+
+/// Fertig hochgeladener Part fuer r2-complete. etag bereits OHNE die
+/// Anfuehrungszeichen aus dem R2-Antwort-Header (die JS-Referenz strippt sie
+/// genauso: res.etag.replace(/"/g, "")).
+struct R2CompletedPart: Sendable {
+    var partNumber: Int
+    var etag: String
+}
+
+/// Antwort von POST /api/admin/videos/{id}/versions/r2-complete
+/// (_finalize_r2_master, routes_admin_versions.py:1092-1098).
+struct R2CompleteResponse: Decodable, Sendable {
+    var id: String
+    var video_id: String?
+    var cf_stream_uid: String?
+    var r2_original_size_bytes: Int64?
+    var status: String?
+}
+
+/// Antwort von POST /api/admin/videos/{id}/versions/r2-abort
+/// (r2_upload_abort, routes_admin_versions.py:1327).
+struct R2AbortResponse: Decodable, Sendable {
+    var status: String?
+    var version_id: String?
+}
+
 // MARK: - Fehler
 
 /// API-Fehler, sauber nach Kategorie getrennt (PLAN.md Abschnitt 9).
@@ -281,18 +338,84 @@ struct ApiClient: Sendable {
         return vid
     }
 
-    // MARK: - presigned Multipart (Fallback, TODO-Stub)
+    // MARK: - presigned Multipart (Dateien ueber dem r2-stream-Cap)
 
-    /// TODO(Fallback): POST /api/admin/videos/{id}/versions/r2-init.
-    /// Nur fuer Dateien ueber ~10 GB. presigned Part-URLs haben TTL 12h
-    /// (PLAN.md Abschnitt 7). In dieser App-Version nicht implementiert.
-    func r2Init(videoID: String, sizeBytes: Int64, filename: String) async throws -> Never {
-        throw ApiError.transport("r2-init Multipart-Fallback ist in dieser App-Version noch nicht implementiert (siehe PLAN.md Abschnitt 7).")
+    /// POST /api/admin/videos/{id}/versions/r2-init
+    /// Legt die Version-Row an und liefert den presigned Upload-Plan ("single"
+    /// bis 4 GiB, sonst "multipart" mit Part-URLs, TTL 12h).
+    /// Request-Schema exakt gespiegelt (R2InitRequest, routes_admin_versions.py:844-848):
+    /// original_filename (1-512 Zeichen), size_bytes (1..32 GiB),
+    /// content_type (Default application/octet-stream),
+    /// max_duration_seconds (1..21600, Default 7200).
+    func r2Init(
+        videoID: String,
+        filename: String,
+        sizeBytes: Int64,
+        contentType: String,
+        maxDurationSeconds: Int
+    ) async throws -> R2InitResponse {
+        // Auf den serverseitigen 6h-Cap deckeln, Minimum 1 (Pydantic ge=1),
+        // analog zu r2StreamRequest.
+        let cappedDuration = min(max(maxDurationSeconds, 1), AppConfig.maxDurationSecondsCap)
+        let body: [String: Any] = [
+            "original_filename": filename,
+            "size_bytes": sizeBytes,
+            "content_type": contentType,
+            "max_duration_seconds": cappedDuration,
+        ]
+        var req = try makeRequest(
+            path: "\(AppConfig.adminPath)/videos/\(videoID)/versions/r2-init",
+            method: "POST")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return try await sendDecoding(req)
     }
 
-    /// TODO(Fallback): POST /api/admin/videos/{id}/versions/r2-complete.
-    func r2Complete(videoID: String, versionID: String) async throws -> Never {
-        throw ApiError.transport("r2-complete Multipart-Fallback ist in dieser App-Version noch nicht implementiert (siehe PLAN.md Abschnitt 7).")
+    /// POST /api/admin/videos/{id}/versions/r2-complete
+    /// Finalisiert den Multipart-Upload aus den gesammelten ETags und triggert
+    /// die Cloudflare-Stream-Kopie (danach cf-refresh-Polling wie bei r2-stream).
+    /// Request-Schema exakt gespiegelt (R2CompleteRequest, routes_admin_versions.py:966-970):
+    /// version_id, upload_id?, parts? [{part_number, etag}],
+    /// max_duration_seconds (1..21600, Default 7200).
+    func r2Complete(
+        videoID: String,
+        versionID: String,
+        uploadID: String?,
+        parts: [R2CompletedPart]?,
+        maxDurationSeconds: Int
+    ) async throws -> R2CompleteResponse {
+        let cappedDuration = min(max(maxDurationSeconds, 1), AppConfig.maxDurationSecondsCap)
+        var body: [String: Any] = [
+            "version_id": versionID,
+            "max_duration_seconds": cappedDuration,
+        ]
+        if let uploadID { body["upload_id"] = uploadID }
+        if let parts {
+            body["parts"] = parts.map { ["part_number": $0.partNumber, "etag": $0.etag] as [String: Any] }
+        }
+        var req = try makeRequest(
+            path: "\(AppConfig.adminPath)/videos/\(videoID)/versions/r2-complete",
+            method: "POST")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return try await sendDecoding(req)
+    }
+
+    /// POST /api/admin/videos/{id}/versions/r2-abort
+    /// Cleanup nach Fehler/Abbruch: gestagete Multipart-Parts verwerfen und die
+    /// reservierte Version-Row loeschen (best effort beim Aufrufer, try?).
+    /// Request-Schema exakt gespiegelt (R2AbortRequest, routes_admin_versions.py:1290-1292):
+    /// version_id, upload_id?.
+    @discardableResult
+    func r2Abort(videoID: String, versionID: String, uploadID: String?) async throws -> R2AbortResponse {
+        var body: [String: Any] = ["version_id": versionID]
+        if let uploadID { body["upload_id"] = uploadID }
+        var req = try makeRequest(
+            path: "\(AppConfig.adminPath)/videos/\(videoID)/versions/r2-abort",
+            method: "POST")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return try await sendDecoding(req)
     }
 
     // MARK: - Ordner anlegen

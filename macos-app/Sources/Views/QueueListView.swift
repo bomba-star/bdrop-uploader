@@ -54,6 +54,15 @@ struct QueueRowView: View {
                     .progressViewStyle(.linear)
             }
 
+            // Hinweis waehrend eines Multipart-Uploads (grosse Dateien): der
+            // Transfer laeuft in einer Vordergrund-Session und ueberlebt das
+            // App-Beenden nicht - deshalb "App offen lassen" samt Teil x/y.
+            if item.status == .uploading, let hint = queue.multipartStatusTexts[item.id] {
+                Text(hint)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
             // Fehlertext.
             if let error = item.lastError, item.status == .failed {
                 Text(error)
@@ -134,7 +143,11 @@ struct QueueRowView: View {
                 .labelStyle(.iconOnly)
             }
 
-            if item.status.isActive && item.status != .uploading {
+            // Pause nur wo sie echt wirkt (Fix H8): .encoding friert den
+            // ffmpeg-Prozess ein, .queued/.encoded nimmt das Item aus der
+            // Pipeline. Probing/Upload/Server-Verarbeitung sind nicht sinnvoll
+            // pausierbar -> Button ausblenden.
+            if item.status == .queued || item.status == .encoding || item.status == .encoded {
                 Button {
                     queue.pause(item)
                 } label: {

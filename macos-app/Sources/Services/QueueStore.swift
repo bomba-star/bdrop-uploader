@@ -11,6 +11,7 @@ import Foundation
 import SwiftData
 import Observation
 import AppKit
+import os
 
 @MainActor
 @Observable
@@ -35,6 +36,12 @@ final class QueueStore {
 
     /// Transiente Statusmeldung fuer die UI (z.B. "Review-Link kopiert").
     var lastStatusMessage: String?
+
+    /// UI-Hinweistext pro Item waehrend eines Multipart-Uploads
+    /// ("Upload läuft (Teil x/y), App offen lassen"). Bewusst in-memory (kein
+    /// SwiftData-Feld): nach Neustart gibt es den Vordergrund-Transfer nicht mehr.
+    /// QueueListView liest den Text direkt ueber die Item-ID.
+    private(set) var multipartStatusTexts: [UUID: String] = [:]
 
     /// Default-Zielprojekt/-ordner (zuletzt benutzt), fuer neue Drops.
     var defaultProjectID: String?
@@ -69,6 +76,25 @@ final class QueueStore {
     /// Fehlern, Fix K6). Bewusst nur in-memory: nach einem App-Neustart darf
     /// sofort erneut versucht werden.
     private var nextRetryAt: [UUID: Date] = [:]
+    /// Laufender R2-HLS-Upload-Task pro Item, damit remove() und das
+    /// App-Beenden den Upload kooperativ abbrechen koennen (Fix H7).
+    private var r2UploadTasks: [UUID: Task<Void, Never>] = [:]
+    /// Laufender Multipart-Upload-Task pro Item (Dateien ueber dem r2-stream-Cap).
+    /// Eigene Registry neben r2UploadTasks, gleiche Abbruch-Semantik: remove()
+    /// und das App-Beenden cancellen kooperativ; den Eintrag raeumt runUpload
+    /// nach dem await konsistent wieder ab (Fix H7-Muster).
+    private var multipartUploadTasks: [UUID: Task<Void, Never>] = [:]
+    /// Item, dessen Encode gerade per SIGSTOP eingefroren ist (Fix H8).
+    /// In-memory: nach einem App-Neustart existiert der Prozess nicht mehr,
+    /// die Crash-Recovery bzw. der normale Retry uebernehmen dann.
+    private var pausedEncodeItemID: UUID?
+    /// Items, deren Upload an einem 401 gescheitert ist. Nur diese werden von
+    /// clearTokenBannerAndResume() zurueckgesetzt - laufende Transfers anderer
+    /// Items bleiben unangetastet (Fix H10).
+    private var authFailedItemIDs: Set<UUID> = []
+
+    /// os.Logger fuer Fehler, die die UI allein nicht transportiert (Fix H11).
+    private let logger = Logger(subsystem: "com.jonasbomba.bdropuploader", category: "QueueStore")
 
     /// Scratch-Ordner fuer encodierte Master (NICHT in ~/sync).
     private let scratchDir: URL
@@ -112,7 +138,15 @@ final class QueueStore {
     }
 
     private func save() {
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            // Persistenz-Fehler sichtbar machen statt still schlucken (Fix H11):
+            // eine verlorene serverVideoId/serverVersionId untergraebt die
+            // Idempotenz und kann nach einem Crash doppelte Videos erzeugen.
+            logger.error("SwiftData-Save fehlgeschlagen: \(error.localizedDescription, privacy: .public)")
+            lastStatusMessage = "Speichern fehlgeschlagen: \(error.localizedDescription)"
+        }
     }
 
     /// Persistiert Editor-Aenderungen an einem Item (vom ItemEditor aufgerufen).
@@ -126,6 +160,10 @@ final class QueueStore {
             title: success ? "Fertig: \(item.displayName)" : "Fehlgeschlagen: \(item.displayName)",
             body: success ? "Bereit." : (item.lastError ?? "Unbekannter Fehler"))
     }
+
+    /// Fehlermeldung des HDR-Gates (Fix H2), an beiden Gate-Stellen identisch.
+    private static let hdrNotSupportedMessage =
+        "HDR-Material (PQ/HLG) wird noch nicht unterstützt. Bitte in SDR wandeln oder Smart-Remux nutzen (Original bleibt erhalten)."
 
     // MARK: - Drop -> neues Item (PLAN.md Abschnitt 11, Schritt 1)
 
@@ -187,12 +225,16 @@ final class QueueStore {
 
     private func runProbeAndEncode(_ item: QueueItem) async {
         defer {
+            // Evtl. veralteten Pause-Merker entsorgen (Fix H8): kehrt die Encode-
+            // Stufe zurueck, ist nichts mehr eingefroren.
+            if pausedEncodeItemID == item.id { pausedEncodeItemID = nil }
             encodeSlotBusy = false
             pumpPipeline()
         }
 
         guard let url = resolveBookmark(for: item) else {
             item.markFailed("Quelle nicht mehr auffindbar (Datei verschoben oder gelöscht).")
+            notifyTerminal(item, success: false)
             save(); reload(); return
         }
         defer { url.stopAccessingSecurityScopedResource() }
@@ -200,6 +242,7 @@ final class QueueStore {
         // Disk-Check vor dem Encode (PLAN.md Abschnitt 9).
         if let free = Self.freeDiskBytes(), free < AppConfig.minFreeDiskBytes {
             item.markFailed("Zu wenig freier Speicher (\(ByteCountFormatter.string(fromByteCount: free, countStyle: .file))). Bitte aufräumen.")
+            notifyTerminal(item, success: false)
             save(); reload(); return
         }
 
@@ -209,14 +252,21 @@ final class QueueStore {
 
         let probe: ProbeResult
         do {
-            probe = try probeService.probe(url: url)
+            // Async: ffprobe laeuft auf einer Hintergrund-Queue, der MainActor
+            // bleibt waehrend des Probes frei (Fix H9).
+            probe = try await probeService.probe(url: url)
         } catch {
             item.markFailed(error.localizedDescription)
+            notifyTerminal(item, success: false)
             save(); reload(); return
         }
+        // Use-after-delete-Schutz nach dem Probe-await (Fix 13-Muster): das Item
+        // koennte waehrend des ffprobe-Laufs entfernt worden sein.
+        guard items.contains(where: { $0.id == item.id }) else { return }
 
         if case .reject(let reason) = probe.classification {
             item.markFailed(reason)
+            notifyTerminal(item, success: false)
             save(); reload(); return
         }
 
@@ -226,6 +276,7 @@ final class QueueStore {
         // 6-Stunden-Cap pruefen (PLAN.md Abschnitt 4).
         if probe.durationSeconds > Double(AppConfig.maxDurationSecondsCap) {
             item.markFailed("Film länger als 6 Stunden - der Server lehnt das aktuell ab.")
+            notifyTerminal(item, success: false)
             save(); reload(); return
         }
 
@@ -257,6 +308,13 @@ final class QueueStore {
 
         // === HLS-Leiter (Ziel B: r2HLS oder lokaler HLS-Export). Immer Neu-Encode. ===
         if target.producesHLS {
+            // HDR-Gate (Fix H2): die HLS-Leiter ist immer ein echter 8-bit-SDR-Encode;
+            // PQ/HLG-Material wuerde sichtbar falsche Farben liefern.
+            if probe.isHDR {
+                item.markFailed(Self.hdrNotSupportedMessage)
+                notifyTerminal(item, success: false)
+                save(); reload(); return
+            }
             let settings = EncodeSettings(
                 plan: .hlsLadder, quality: quality, sourceWasCompatible: false, videoTag: "avc1")
             item.encodeSettings = settings
@@ -282,21 +340,43 @@ final class QueueStore {
                     // r2HLS: die lokal erzeugte Leiter nach R2 hochladen und (best
                     // effort) den r2_hls_path setzen (Track B). Laeuft bewusst innerhalb
                     // der Encode-Stufe - der Encode-Slot bleibt bis zum Ende belegt.
-                    await runR2HLSUpload(item, outDir: outDir)
+                    // Als eigener, registrierter Task, damit remove() und das
+                    // App-Beenden den Upload kooperativ abbrechen koennen (Fix H7).
+                    let uploadItemID = item.id
+                    let uploadTask = Task { await self.runR2HLSUpload(item, outDir: outDir) }
+                    r2UploadTasks[uploadItemID] = uploadTask
+                    await uploadTask.value
+                    r2UploadTasks.removeValue(forKey: uploadItemID)
                 }
                 save(); reload()
             } catch EncodeError.cancelled {
-                // .cancelled tritt nur via remove() auf (Item wird geloescht) (Fix 13/18).
+                // .cancelled: via remove() (Item wird geloescht, Fix 13/18) oder beim
+                // App-Beenden (Fix H12) - dann bleibt das Item und geht auf queued.
+                // Ausnahme: ein pausiertes Item bleibt pausiert (Fix H8).
                 guard items.contains(where: { $0.id == item.id }) else { return }
-                item.status = .queued; item.setProgress(0); save(); reload()
+                if item.status != .paused { item.status = .queued; item.setProgress(0) }
+                save(); reload()
             } catch {
-                item.markFailed(error.localizedDescription); save(); reload()
+                // Use-after-delete-Schutz (Fix 13): kein markFailed/notify auf
+                // einem bereits entfernten Item.
+                guard items.contains(where: { $0.id == item.id }) else { return }
+                item.markFailed(error.localizedDescription)
+                notifyTerminal(item, success: false)
+                save(); reload()
             }
             return
         }
 
         // === H.264-Master (cfStream-Upload oder lokaler H.264-Export) ===
         let settings = EncodeService.plan(for: probe, quality: quality)
+        // HDR-Gate (Fix H2): nur der Smart-Remux laesst die Farben unangetastet.
+        // Jeder echte Encode-Pfad ist 8-bit-SDR und wuerde PQ/HLG-Material
+        // sichtbar verfaelschen -> klar fehlschlagen statt still falsch liefern.
+        if probe.isHDR && settings.plan != .smartRemux {
+            item.markFailed(Self.hdrNotSupportedMessage)
+            notifyTerminal(item, success: false)
+            save(); reload(); return
+        }
         item.encodeSettings = settings
         item.status = .encoding
         item.setProgress(0)
@@ -322,13 +402,21 @@ final class QueueStore {
             }
             save(); reload()
         } catch EncodeError.cancelled {
-            // .cancelled tritt nur via remove() auf (Item wird geloescht) (Fix 13/18).
+            // .cancelled: via remove() (Item wird geloescht, Fix 13/18) oder beim
+            // App-Beenden (Fix H12) - dann bleibt das Item und geht auf queued.
+            // Ausnahme: ein pausiertes Item bleibt pausiert (Fix H8).
             guard items.contains(where: { $0.id == item.id }) else { return }
-            item.status = .queued
-            item.setProgress(0)
+            if item.status != .paused {
+                item.status = .queued
+                item.setProgress(0)
+            }
             save(); reload()
         } catch {
+            // Use-after-delete-Schutz (Fix 13): kein markFailed/notify auf
+            // einem bereits entfernten Item.
+            guard items.contains(where: { $0.id == item.id }) else { return }
             item.markFailed(error.localizedDescription)
+            notifyTerminal(item, success: false)
             save(); reload()
         }
     }
@@ -340,6 +428,7 @@ final class QueueStore {
     private func finishLocalExport(_ item: QueueItem, from source: URL, isDirectory: Bool) {
         guard let dest = resolveExportDirectory() else {
             item.markFailed("Kein Export-Ordner gewählt. Bitte in den Einstellungen festlegen.")
+            notifyTerminal(item, success: false)
             return
         }
         let accessing = dest.startAccessingSecurityScopedResource()
@@ -411,10 +500,15 @@ final class QueueStore {
     /// r2_hls_path. Wird aus runProbeAndEncode heraus aufgerufen und laeuft innerhalb
     /// der Encode-Stufe (der Encode-Slot wird erst per defer in runProbeAndEncode frei).
     private func runR2HLSUpload(_ item: QueueItem, outDir: URL) async {
+        // Use-after-delete-/Cancel-Schutz direkt am Anfang: seit dem Task-Wrapper
+        // (Fix H7) kann remove() zwischen Task-Start und erster Ausfuehrung
+        // interleaven - dann ist das Item schon geloescht.
+        guard !Task.isCancelled, items.contains(where: { $0.id == item.id }) else { return }
         // R2-Konfiguration + Credentials laden. Fehlt etwas -> ehrlich fehlschlagen.
         guard let r2config = R2Config.load(), r2config.isComplete,
               let creds = tokenStore.r2Credentials() else {
             item.markFailed("4K-HLS erzeugt - R2 nicht konfiguriert. Bitte R2-Zugang in den Einstellungen eintragen.")
+            notifyTerminal(item, success: false)
             save(); reload(); return
         }
 
@@ -434,13 +528,18 @@ final class QueueStore {
                     projectID: item.projectId,
                     folderID: item.folderId)
             } catch let error as ApiError where error == .unauthorized {
-                handleUnauthorized()
+                handleUnauthorized(item)
                 guard items.contains(where: { $0.id == item.id }) else { return }
                 item.markFailed(ApiError.unauthorized.localizedDescription)
+                notifyTerminal(item, success: false)
                 save(); reload(); return
+            } catch is CancellationError {
+                // Abbruch via remove()/App-Beenden (Fix H7): keine Fehler-Notification.
+                return
             } catch {
                 guard items.contains(where: { $0.id == item.id }) else { return }
                 item.markFailed("Video anlegen fehlgeschlagen: \(error.localizedDescription)")
+                notifyTerminal(item, success: false)
                 save(); reload(); return
             }
             // Use-after-delete-Schutz nach dem createVideo-await (Fix 13).
@@ -476,6 +575,11 @@ final class QueueStore {
             config: r2config, accessKeyId: creds.accessKey, secretAccessKey: creds.secretKey)
         do {
             try await uploader.uploadTree(localDir: outDir, videoID: videoID, onProgress: onR2Progress)
+        } catch is CancellationError {
+            // Abbruch via remove()/App-Beenden (Fix H7): das Item ist ggf. schon
+            // geloescht - kein Status-Umbau, keine Fehler-Notification. Den
+            // Encode-Slot gibt der defer in runProbeAndEncode frei.
+            return
         } catch {
             // Use-after-delete-Schutz vor dem Mutieren (Fix 13).
             guard items.contains(where: { $0.id == item.id }) else { return }
@@ -556,8 +660,8 @@ final class QueueStore {
             }
 
             // Groessen-Gate vor dem Stream-Upload: der r2-stream-Pfad ist serverseitig
-            // gedeckelt (413 nach Stunden). Der Multipart-Fallback ist nur ein Stub,
-            // deshalb hier terminal fehlschlagen statt sinnlos hochzuladen (Fix K5).
+            // gedeckelt (413 nach Stunden, Fix K5). Groessere Master gehen ueber den
+            // presigned Multipart-Pfad direkt nach R2 (r2-init -> Parts -> r2-complete).
             let uploadBytes: Int64? = {
                 if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
                    let size = attrs[.size] as? Int64 {
@@ -566,11 +670,18 @@ final class QueueStore {
                 return item.sourceSizeBytes
             }()
             if let bytes = uploadBytes, bytes > AppConfig.r2StreamMaxBytes {
-                let sizeText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-                let limitText = ByteCountFormatter.string(fromByteCount: AppConfig.r2StreamMaxBytes, countStyle: .file)
-                item.markFailed("Datei zu groß für den Upload (\(sizeText), Limit \(limitText)). Multipart-Upload ist noch nicht implementiert.")
-                notifyTerminal(item, success: false)
-                finishUploadSlot(); save(); reload(); return
+                // Als registrierter Task, damit remove() und das App-Beenden den
+                // Vordergrund-Transfer kooperativ abbrechen koennen (Fix H7-Muster).
+                // Der Slot bleibt bis zum Ende des Multipart-Flows (inkl. Verify)
+                // belegt, analog zum Background-Pfad.
+                let multipartItemID = item.id
+                let uploadTask = Task {
+                    await self.runMultipartUpload(item, videoID: videoID, fileURL: fileURL, sizeBytes: bytes)
+                }
+                multipartUploadTasks[multipartItemID] = uploadTask
+                await uploadTask.value
+                multipartUploadTasks.removeValue(forKey: multipartItemID)
+                finishUploadSlot(); reload(); return
             }
 
             // r2-stream-Upload starten (Background-Session). Die version_id kommt
@@ -593,7 +704,7 @@ final class QueueStore {
                 maxDurationSeconds: maxDuration)
             // Slot bleibt belegt bis didComplete; Freigabe erfolgt in den Delegate-Pfaden.
         } catch let error as ApiError where error == .unauthorized {
-            handleUnauthorized()
+            handleUnauthorized(item)
             // Item zurueck auf encoded, damit es nach Token-Eingabe weiterlaeuft.
             item.status = .encoded
             finishUploadSlot(); save(); reload()
@@ -626,11 +737,252 @@ final class QueueStore {
         save(); reload()
     }
 
+    // MARK: - Multipart-Upload (Dateien ueber dem r2-stream-Cap, PLAN.md Abschnitt 7)
+
+    /// Laedt einen Master ueber dem r2-stream-Cap per presigned Multipart direkt
+    /// nach R2: r2-init -> Part-PUTs (MultipartUploader) -> r2-complete -> danach
+    /// dieselbe Verify-Strecke (cf-refresh-Polling, .serverProcessing) wie der
+    /// r2-stream-Pfad. Laeuft komplett im Vordergrund - anders als der Background-
+    /// Pfad ueberlebt der Transfer das App-Beenden NICHT; die UI zeigt dafuer den
+    /// "App offen lassen"-Hinweis (multipartStatusTexts).
+    /// Kein throw: Fehler werden hier selbst behandelt (handleUploadError fuer die
+    /// Retry-Taxonomie); ein Retry beginnt von vorn mit frischem r2-init.
+    private func runMultipartUpload(_ item: QueueItem, videoID: String, fileURL: URL, sizeBytes: Int64) async {
+        // Cancel-/Use-after-delete-Schutz direkt am Anfang: remove() kann
+        // zwischen Task-Start und erster Ausfuehrung interleaven (Fix H7-Muster).
+        guard !Task.isCancelled, items.contains(where: { $0.id == item.id }) else { return }
+
+        // Serverseitiges Pydantic-Limit des presigned Pfads: 32 GiB. Darueber
+        // wuerde r2-init mit 422 ablehnen -> ehrlich terminal fehlschlagen.
+        guard sizeBytes <= AppConfig.r2InitMaxBytes else {
+            let sizeText = ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+            let limitText = ByteCountFormatter.string(fromByteCount: AppConfig.r2InitMaxBytes, countStyle: .file)
+            item.markFailed("Datei zu groß für den Upload (\(sizeText), Server-Limit \(limitText)).")
+            notifyTerminal(item, success: false)
+            save(); reload(); return
+        }
+
+        item.status = .uploading
+        item.setProgress(0)
+        multipartStatusTexts[item.id] = "Großer Upload wird vorbereitet, App offen lassen."
+        save(); reload()
+
+        // etwas Puffer wie beim r2-stream-Pfad (H6, derive_max_duration-Referenz);
+        // den 6h-Server-Cap deckeln r2Init/r2Complete selbst.
+        let maxDuration = Int((item.durationSeconds ?? 0).rounded(.up)) + 5
+
+        // v1-Einschraenkung (Crash-Verhalten): stirbt die App zwischen r2-init und
+        // r2-complete, bleibt serverseitig eine processing-Version-Row zurueck -
+        // serverVersionId wird bewusst erst NACH r2-complete gesetzt, die
+        // Crash-Recovery kennt die Row also nicht und raeumt sie nicht auf
+        // (Cleanup nur manuell bzw. serverseitig).
+        let initResp: R2InitResponse
+        do {
+            initResp = try await apiClient.r2Init(
+                videoID: videoID,
+                filename: item.displayName,
+                sizeBytes: sizeBytes,
+                contentType: "video/mp4",
+                maxDurationSeconds: maxDuration)
+        } catch {
+            multipartStatusTexts.removeValue(forKey: item.id)
+            // Abbruch via remove()/App-Beenden: der URLSession-Cancel kommt als
+            // (in ApiError.transport gewickelter) Fehler an - nicht als Fehler werten.
+            if Task.isCancelled || error is CancellationError { return }
+            guard items.contains(where: { $0.id == item.id }) else { return }
+            handleUploadError(item: item, error: error)
+            return
+        }
+
+        // Use-after-delete-Schutz nach dem r2-init-await (Fix 13): das Item ist
+        // weg, die frisch reservierte Version-Row wieder aufraeumen.
+        guard items.contains(where: { $0.id == item.id }) else {
+            abortMultipartBestEffort(videoID: videoID, versionID: initResp.id, uploadID: initResp.upload_id)
+            multipartStatusTexts.removeValue(forKey: item.id)
+            return
+        }
+
+        // Fuer Dateien ueber dem Stream-Cap (10 GB) liefert der Server immer
+        // "multipart" (Single-PUT-Schwelle liegt bei 4 GiB). Alles andere ist
+        // ein Plan-Mismatch -> aufraeumen und klar fehlschlagen.
+        guard initResp.mode == "multipart",
+              let uploadID = initResp.upload_id,
+              let partSize = initResp.part_size,
+              let partURLs = initResp.parts, !partURLs.isEmpty else {
+            abortMultipartBestEffort(videoID: videoID, versionID: initResp.id, uploadID: initResp.upload_id)
+            multipartStatusTexts.removeValue(forKey: item.id)
+            item.markFailed("Unerwarteter Upload-Plan vom Server (mode=\(initResp.mode)).")
+            notifyTerminal(item, success: false)
+            save(); reload(); return
+        }
+
+        let totalParts = partURLs.count
+        multipartStatusTexts[item.id] = "Upload läuft (Teil 1/\(totalParts)), App offen lassen."
+        save(); reload()
+
+        // item (SwiftData @Model) ist nicht Sendable -> nur die UUID in die
+        // @Sendable-Progress-Closure fangen (Muster wie onR2Progress).
+        let progressItemID = item.id
+        let onPartProgress: @Sendable (Int64, Int64, Int, Int) -> Void = { [weak self] doneBytes, totalBytes, doneParts, allParts in
+            Task { @MainActor in
+                guard let self,
+                      let target = self.items.first(where: { $0.id == progressItemID }) else { return }
+                if totalBytes > 0 { target.setProgress(Double(doneBytes) / Double(totalBytes)) }
+                // Nach Part k laeuft als naechstes k+1. Nur aktualisieren solange
+                // der Eintrag lebt - kein Wiederbeleben nach dem Cleanup (Race).
+                if self.multipartStatusTexts[progressItemID] != nil {
+                    let currentPart = min(doneParts + 1, allParts)
+                    self.multipartStatusTexts[progressItemID] = "Upload läuft (Teil \(currentPart)/\(allParts)), App offen lassen."
+                }
+            }
+        }
+
+        let uploader = MultipartUploader()
+        let completedParts: [R2CompletedPart]
+        do {
+            completedParts = try await uploader.uploadParts(
+                fileURL: fileURL,
+                totalSizeBytes: sizeBytes,
+                partSizeBytes: partSize,
+                parts: partURLs,
+                onProgress: onPartProgress)
+        } catch {
+            // In JEDEM Fehler-/Abbruchfall die Server-Seite best effort aufraeumen
+            // (Multipart abbrechen + Version-Row loeschen), wie die JS-Referenz.
+            abortMultipartBestEffort(videoID: videoID, versionID: initResp.id, uploadID: uploadID)
+            multipartStatusTexts.removeValue(forKey: item.id)
+            if Task.isCancelled || error is CancellationError { return }
+            guard items.contains(where: { $0.id == item.id }) else { return }
+            handleUploadError(item: item, error: Self.mapMultipartError(error))
+            return
+        }
+
+        // Use-after-delete-Schutz nach dem Part-Upload (Fix 13).
+        guard items.contains(where: { $0.id == item.id }) else {
+            abortMultipartBestEffort(videoID: videoID, versionID: initResp.id, uploadID: uploadID)
+            multipartStatusTexts.removeValue(forKey: item.id)
+            return
+        }
+
+        multipartStatusTexts[item.id] = "Upload wird abgeschlossen, App offen lassen."
+        save(); reload()
+
+        let versionID: String
+        do {
+            let completeResp = try await apiClient.r2Complete(
+                videoID: videoID,
+                versionID: initResp.id,
+                uploadID: uploadID,
+                parts: completedParts,
+                maxDurationSeconds: maxDuration)
+            versionID = completeResp.id
+        } catch {
+            abortMultipartBestEffort(videoID: videoID, versionID: initResp.id, uploadID: uploadID)
+            multipartStatusTexts.removeValue(forKey: item.id)
+            if Task.isCancelled || error is CancellationError { return }
+            guard items.contains(where: { $0.id == item.id }) else { return }
+            handleUploadError(item: item, error: error)
+            return
+        }
+
+        multipartStatusTexts.removeValue(forKey: item.id)
+        guard items.contains(where: { $0.id == item.id }) else { return }
+
+        // Idempotenz-Klammer erst NACH erfolgreichem r2-complete setzen: vorher
+        // gesetzt wuerde ein Retry faelschlich direkt zum cf-refresh-Polling
+        // springen, obwohl noch gar keine CF-Kopie existiert.
+        item.serverVersionId = versionID
+        save()
+
+        // Dieselbe Verify-Strecke wie der r2-stream-Pfad (.serverProcessing,
+        // cf-refresh-Polling, Scratch-Cleanup bei Erfolg).
+        do {
+            try await verify(item: item, versionID: versionID)
+        } catch {
+            if Task.isCancelled || error is CancellationError { return }
+            guard items.contains(where: { $0.id == item.id }) else { return }
+            handleUploadError(item: item, error: error)
+        }
+    }
+
+    /// r2-abort best effort in einem eigenen, NICHT mit-gecancelten Task: der
+    /// haeufigste Aufrufgrund ist gerade ein Cancel (remove()/App-Beenden), der
+    /// den Cleanup-Request sonst sofort mit abbrechen wuerde. Beim App-Beenden
+    /// kann der Request trotzdem abgeschnitten werden (bewusst best effort).
+    private func abortMultipartBestEffort(videoID: String, versionID: String, uploadID: String?) {
+        let client = apiClient
+        Task.detached {
+            _ = try? await client.r2Abort(videoID: videoID, versionID: versionID, uploadID: uploadID)
+        }
+    }
+
+    /// Mappt MultipartUploadError auf die ApiError-Retry-Taxonomie: transiente
+    /// Faelle (Netz, 429/5xx nach ausgeschoepftem Part-Retry) werden zu
+    /// .transport, damit handleUploadError den Backoff-Retry faehrt (Fix K6);
+    /// der Retry beginnt dann mit frischem r2-init. Harte Faelle (Plan-Mismatch,
+    /// fehlendes ETag, 4xx) bleiben terminal.
+    private static func mapMultipartError(_ error: Error) -> Error {
+        guard let e = error as? MultipartUploadError else { return error }
+        switch e {
+        case .transport(let m):
+            return ApiError.transport(m)
+        case .httpError(let status, _) where status == 429 || (500...599).contains(status):
+            return ApiError.transport(e.localizedDescription)
+        default:
+            return e
+        }
+    }
+
     // MARK: - Slot-Freigabe
 
     private func finishUploadSlot() {
         if activeUploads > 0 { activeUploads -= 1 }
         pumpPipeline()
+    }
+
+    // MARK: - App-Beenden (Fix H12)
+
+    /// Ob gerade die Encode-Stufe mit einem lokalen ffmpeg/ffprobe-Prozess laeuft.
+    /// Grundlage fuer den Beenden-Dialog: nur dann liefe beim harten Beenden ein
+    /// Waisenprozess weiter (die r2HLS-Upload-Phase haelt den Slot ohne ffmpeg).
+    /// Ein per Pause eingefrorener Encode (Fix H8) zaehlt mit: der SIGSTOP-Prozess
+    /// bliebe sonst als Waise im T-State zurueck.
+    var hasActiveEncode: Bool {
+        encodeSlotBusy && (pausedEncodeItemID != nil
+            || items.contains { $0.status == .encoding || $0.status == .probing })
+    }
+
+    /// Ob gerade ein Multipart-Upload (Vordergrund-URLSession) laeuft. Zweite
+    /// Grundlage fuer den Beenden-Dialog: anders als die r2-stream-Background-
+    /// Uploads ueberlebt dieser Transfer das App-Beenden NICHT. Die Verify-Phase
+    /// (.serverProcessing) zaehlt bewusst nicht mit - die erledigt der Server,
+    /// das Polling setzt die Crash-Recovery beim naechsten Start fort.
+    var hasActiveMultipartUpload: Bool {
+        items.contains { multipartUploadTasks[$0.id] != nil && $0.status == .uploading }
+    }
+
+    /// Ob gerade die R2-HLS-Upload-Phase laeuft (r2UploadTasks-Registry, Fix H7).
+    /// Auch das ist eine Vordergrund-URLSession, die das App-Beenden nicht
+    /// ueberlebt; ohne Warnung ginge ein kompletter Encode+Upload still verloren.
+    var hasActiveR2HLSUpload: Bool {
+        items.contains { r2UploadTasks[$0.id] != nil && $0.status == .uploading }
+    }
+
+    /// Bricht den laufenden Encode fuer das App-Beenden ab (Fix H12).
+    /// Kein Status-Umbau noetig: laeuft der .cancelled-Pfad nicht mehr komplett
+    /// durch, setzt die Crash-Recovery beim naechsten Start encoding/probing-Items
+    /// ohnehin sauber auf queued zurueck.
+    func cancelActiveEncodeForTermination() async {
+        // Laufende R2-HLS-Uploads kooperativ mit abbrechen (Fix H7): die
+        // Vordergrund-URLSession ueberlebt das Beenden ohnehin nicht, der
+        // Cancel sorgt fuer einen sauberen Abbruchpfad statt haengender awaits.
+        for task in r2UploadTasks.values { task.cancel() }
+        // Laufende Multipart-Uploads ebenfalls (gleiche Vordergrund-Semantik).
+        // Der Cancel stoesst best effort r2-abort an; beim Beenden kann der
+        // Cleanup-Request abgeschnitten werden (v1-Einschraenkung, siehe
+        // runMultipartUpload).
+        for task in multipartUploadTasks.values { task.cancel() }
+        await encodeService.cancel()
     }
 
     // MARK: - Nutzer-Aktionen (Retry / Pause / Remove)
@@ -640,8 +992,22 @@ final class QueueStore {
     /// direkt in die Verify-Phase statt neu hochzuladen.
     func retry(_ item: QueueItem) {
         guard item.status.isRetryable else { return }
+        // Fortsetzen eines pausierten Encodes (Fix H8): der ffmpeg-Prozess haengt
+        // per SIGSTOP, der urspruengliche runProbeAndEncode-Aufruf wartet im await.
+        // SIGCONT laesst ihn exakt dort weiterlaufen - KEIN Re-Queue, sonst
+        // Deadlock (Slot bleibt vom eingefrorenen Prozess belegt).
+        if item.status == .paused && item.id == pausedEncodeItemID {
+            pausedEncodeItemID = nil
+            item.status = .encoding
+            save(); reload()
+            Task { await encodeService.resume() }
+            return
+        }
         item.lastError = nil
-        item.retryCount += 1
+        // Manueller Retry gewaehrt ein frisches Auto-Retry-Budget: sonst waere
+        // nach 3 automatischen Versuchen + einem Klick der Backoff-Schutz fuer
+        // den Rest der Session ausgehebelt (Review Runde 2).
+        item.retryCount = 0
         // Manueller Retry umgeht einen evtl. laufenden Backoff (Fix K6).
         nextRetryAt.removeValue(forKey: item.id)
         // Lokale Konvertierungen und r2HLS haben keine Upload-Idempotenz-Klammer und
@@ -659,9 +1025,24 @@ final class QueueStore {
         pumpPipeline()
     }
 
-    /// Pausiert ein Item (harter Stop, geht beim Resume neu durch die Stufe).
+    /// Pausiert ein Item (Fix H8). Nur fuer .encoding echt verdrahtet: der
+    /// ffmpeg-Prozess wird per SIGSTOP eingefroren, der laufende
+    /// runProbeAndEncode haengt einfach im await (das Progress-Lesen blockt
+    /// derweil in availableData). Fortsetzen laeuft ueber retry() -> SIGCONT.
+    /// .queued/.encoded werden nur aus der Pipeline genommen (kein Prozess).
+    /// .probing/.uploading/.serverProcessing sind nicht sinnvoll pausierbar -
+    /// die QueueListView blendet den Button dort aus.
     func pause(_ item: QueueItem) {
-        item.status = .paused
+        switch item.status {
+        case .encoding:
+            pausedEncodeItemID = item.id
+            item.status = .paused
+            Task { await encodeService.pause() }
+        case .queued, .encoded:
+            item.status = .paused
+        default:
+            return
+        }
         save(); reload()
     }
 
@@ -669,14 +1050,26 @@ final class QueueStore {
     func remove(_ item: QueueItem) {
         // Laufende Arbeit stoppen, bevor das Item geloescht wird (Fix 18).
         uploadService.cancelTask(itemID: item.id)
-        if item.status == .encoding || item.status == .probing {
+        // Laufenden R2-HLS-Upload kooperativ abbrechen (Fix H7).
+        r2UploadTasks[item.id]?.cancel()
+        // Laufenden Multipart-Upload kooperativ abbrechen; der Task raeumt die
+        // Server-Seite (r2-abort) und den Status-Text selbst best effort auf.
+        multipartUploadTasks[item.id]?.cancel()
+        // Auch ein per Pause eingefrorener Encode muss beendet werden, sonst
+        // haengt der Slot ewig (Fix H8); cancel() schickt SIGCONT vor SIGTERM
+        // (Fix K4), der T-State-Prozess bekommt das Signal also zugestellt.
+        if item.status == .encoding || item.status == .probing || item.id == pausedEncodeItemID {
             Task { await encodeService.cancel() }
         }
+        if item.id == pausedEncodeItemID { pausedEncodeItemID = nil }
         if let path = item.outputPath {
             try? FileManager.default.removeItem(atPath: path)
         }
-        // Evtl. gemerkten Backoff-Eintrag mit entsorgen (Fix K6).
+        // Evtl. gemerkten Backoff-Eintrag, 401-Markierung und Multipart-
+        // Hinweistext mit entsorgen.
         nextRetryAt.removeValue(forKey: item.id)
+        authFailedItemIDs.remove(item.id)
+        multipartStatusTexts.removeValue(forKey: item.id)
         modelContext.delete(item)
         save(); reload()
     }
@@ -713,18 +1106,24 @@ final class QueueStore {
 
     // MARK: - Token / Fehler (PLAN.md Abschnitt 9)
 
-    private func handleUnauthorized() {
-        // 401: alle Slots pausieren, Banner zeigen. NICHT bei 429.
+    /// 401: Banner zeigen, keine neue Arbeit starten. Das betroffene Item wird
+    /// markiert, damit clearTokenBannerAndResume() gezielt NUR dieses Item
+    /// zuruecksetzt und laufende Transfers anderer Items in Ruhe laesst (Fix H10).
+    private func handleUnauthorized(_ item: QueueItem? = nil) {
         tokenBannerVisible = true
+        if let item { authFailedItemIDs.insert(item.id) }
     }
 
     /// Nach Token-Eingabe: Banner weg, Pipeline weiterlaufen lassen.
     func clearTokenBannerAndResume() {
         tokenBannerVisible = false
-        // Items in uploading ohne aktiven Task zurueck auf encoded.
-        for item in items where item.status == .uploading {
+        // Nur die vom 401 betroffenen Items zuruecksetzen (Fix H10). Aktive
+        // Background-Transfers anderer Items liefen die ganze Zeit weiter und
+        // wuerden durch einen pauschalen Reset doppelt gestartet.
+        for item in items where authFailedItemIDs.contains(item.id) && item.status == .uploading {
             item.status = .encoded
         }
+        authFailedItemIDs.removeAll()
         save(); reload()
         pumpPipeline()
     }
@@ -733,7 +1132,7 @@ final class QueueStore {
         if let api = error as? ApiError {
             switch api {
             case .unauthorized:
-                handleUnauthorized()
+                handleUnauthorized(item)
                 item.status = .encoded
             case .rateLimited, .serviceUnavailable, .transport:
                 // Transient: zurueck auf encoded, aber mit Backoff statt sofortigem
@@ -794,11 +1193,16 @@ final class QueueStore {
 
     // MARK: - Crash-Recovery beim Start (PLAN.md Abschnitt 8)
 
-    /// Muss einmal beim App-Start gerufen werden (nach Init).
+    /// Muss einmal beim App-Start gerufen werden (nach Init), VOR anderer
+    /// potenziell langer Start-Arbeit (Aufruf-Reihenfolge siehe BDropUploaderApp).
     func performCrashRecovery() async {
         reload()
 
-        // 1) Background-URLSession re-attachen: welche Item-IDs haben noch Tasks?
+        // 1) Background-URLSession re-attachen: welche Item-IDs haben noch Tasks
+        // ODER bereits eingetroffene Delegate-Ereignisse? Erst nach Abschluss
+        // dieser Abfrage wird ueber .uploading-Items entschieden - ein im Daemon
+        // fertig gewordener Transfer darf nicht als "verloren" gelten und neu
+        // hochgeladen werden (Duplikat-Version, Fix H4).
         let attachedIDs = Set(await uploadService.reattachTasks())
 
         for item in items {
@@ -833,10 +1237,13 @@ final class QueueStore {
                         self.pumpPipeline()
                     }
                 } else if attachedIDs.contains(item.id) {
-                    // Transfer laeuft noch im Daemon -> nichts tun, Delegate uebernimmt.
+                    // Transfer laeuft noch im Daemon ODER sein Abschluss-Event ist
+                    // schon eingetroffen/unterwegs -> nichts tun, Delegate
+                    // uebernimmt (Fix H4).
                     break
                 } else {
-                    // Kein Task, keine version_id -> neu hochladen.
+                    // Weder Task noch Event noch version_id -> wirklich verloren,
+                    // neu hochladen.
                     item.status = .encoded
                 }
 

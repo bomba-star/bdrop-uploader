@@ -16,7 +16,7 @@ enum EncodePlan: String, Codable, Sendable {
     case hardwareH264
     /// Software-H.264 (libx264 -preset slow -crf 18), maximale Qualitaet.
     case softwareX264
-    /// TODO(Ziel B): lokale HLS-Ladder. Noch nicht implementiert.
+    /// 4K-HLS-Leiter, implementiert in HLSLadderBuilder + EncodeService.encodeHLS.
     case hlsLadder
 
     var germanLabel: String {

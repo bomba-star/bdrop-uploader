@@ -67,7 +67,11 @@ enum HLSLadderBuilder {
         for i in 0..<n { filter += "[s\(i)]" }
         filter += ";"
         for (i, r) in selected.enumerated() {
-            filter += "[s\(i)]scale=\(r.scaleWidth):-2:flags=lanczos,setsar=1[v\(i)]"
+            // Clamp gegen die tatsaechliche Framebreite (min(W,iw)) analog zum
+            // Single-Master-Pfad in EncodeService.scaleArgs: nie hochskalieren,
+            // auch wenn die Sprossen-Auswahl auf Metadaten beruhte (Fix H1).
+            // Breite dabei auf gerade Werte truncaten (yuv420p verlangt das).
+            filter += "[s\(i)]scale='trunc(min(\(r.scaleWidth),iw)/2)*2':-2:flags=lanczos,setsar=1[v\(i)]"
             if i < n - 1 { filter += ";" }
         }
         args += ["-filter_complex", filter]

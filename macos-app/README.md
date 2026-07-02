@@ -6,9 +6,11 @@ persistente Queue legt und über die B-Drop/CineReview Admin-API zu Cloudflare
 Stream hochlaedt (Ziel A). Uploads laufen über eine Background-URLSession weiter,
 auch wenn die App geschlossen wird.
 
-Diese Quell-Struktur setzt **Ziel A (CF-Stream-Weg)** aus dem Plan um. **Ziel B
-(4K-HLS auf R2)** ist bewusst NICHT implementiert, nur als TODO-Platzhalter
-vorgesehen (`Sources/Services/HLSLadderBuilder.swift`).
+Diese Quell-Struktur setzt **Ziel A (CF-Stream-Weg)** um. **Ziel B (4K-HLS auf
+R2)** ist app-seitig ebenfalls implementiert: `HLSLadderBuilder` baut die
+adaptive HLS-Leiter, `R2Uploader` laedt sie SigV4-signiert in den privaten
+R2-Bucket. Die serverseitige Auslieferung (`r2_hls_path`) ist teilweise live
+(Track B).
 
 ---
 
@@ -54,6 +56,25 @@ Hauptfenster ziehen.
 
 ---
 
+## Erststart mit dem CI-Artifact (unsigniert)
+
+Der GitHub-Actions-Workflow (`macos-build.yml`) baut die App unsigniert und
+nicht notarisiert. macOS versieht heruntergeladene Dateien mit dem
+Quarantäne-Attribut; Gatekeeper verweigert unsignierten Apps dann den Start
+(Meldung "beschädigt" oder "kann nicht überprüft werden"). Deshalb:
+
+1. Im Actions-Lauf das Artifact **`BDropUploader-app`** herunterladen und
+   entpacken (ergibt `BDropUploader.app`).
+2. Quarantäne entfernen:
+
+   ```
+   xattr -dr com.apple.quarantine "BDropUploader.app"
+   ```
+
+3. Danach normal per Doppelklick starten und wie oben Token/Projekt einrichten.
+
+---
+
 ## Datei-zu-PLAN.md-Mapping
 
 | Datei | PLAN.md-Abschnitt | Rolle |
@@ -67,7 +88,8 @@ Hauptfenster ziehen.
 | `Sources/Models/EncodeSettings.swift` | 5, 8 | Eingefrorener Encode-Plan-Snapshot (JSON-persistiert) |
 | `Sources/Services/ProbeService.swift` | 5, 4, 10 | ffprobe, Klassifikation tauglich/encode/ablehnen (einzige Codec-Schranke) |
 | `Sources/Services/EncodeService.swift` | 5, 8, 9, 10 | ffmpeg-Befehlsbau, -progress-Parsing, ein Slot, VideoToolbox-Fallback |
-| `Sources/Services/HLSLadderBuilder.swift` | 6, 7 | TODO-Platzhalter für Ziel B (4K-HLS), nicht implementiert |
+| `Sources/Services/HLSLadderBuilder.swift` | 6, 7 | Ziel B: adaptive 4K-HLS-Leiter (ffmpeg-Argumentbau) |
+| `Sources/Services/R2Uploader.swift` | 6, 7 | Ziel B: SigV4-Upload der HLS-Leiter in den privaten R2-Bucket |
 | `Sources/Services/ApiClient.swift` | 4, 7, 9, 10 | Admin-REST-Wrapper, Bearer, 401/429/503-Unterscheidung |
 | `Sources/Services/UploadService.swift` | 7, 8, 10 | r2-stream via Background-URLSession, cf-refresh-Backoff, Re-Attach |
 | `Sources/Services/TokenStore.swift` | 4, 10 | Admin-Token (+ optionale R2-Creds) in der Keychain |
@@ -84,8 +106,9 @@ Hauptfenster ziehen.
 
 ## Was bewusst noch fehlt (Caveats)
 
-- **Ziel B (4K-HLS auf R2):** komplett ungebaut, nur Platzhalter. Haengt an der
-  R2-HLS-Serverpipeline (Worker + `r2_hls_path`-Auslieferung).
+- **Ziel B (4K-HLS auf R2):** app-seitig implementiert (Leiter + R2-Upload);
+  die serverseitige Auslieferung (`r2_hls_path` im Player) ist erst teilweise
+  live - die Aktivierung setzt die App deshalb nur best effort.
 - **Multipart-Fallback (r2-init/r2-complete):** für Dateien über ~10 GB. Nur
   TODO-Stub in `ApiClient`/`UploadService`. Default-Pfad ist r2-stream.
 - **HDR/Rec.2020-Tonemapping:** kein Default. HEVC-10-bit-Quellen werden nach

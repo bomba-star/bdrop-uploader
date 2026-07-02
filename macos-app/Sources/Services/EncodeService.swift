@@ -74,9 +74,16 @@ actor EncodeService {
     }
 
     /// Liefert das -vf-Scale-Argument fuer die Aufloesungs-Obergrenze der Stufe.
-    /// Skaliert nur herunter (min(maxW,iw)), nie hoch. Leer, wenn keine Grenze.
+    /// Skaliert nur herunter (min(maxW,iw)), nie hoch.
     private static func scaleArgs(for quality: EncodeQuality) -> [String] {
-        guard let w = quality.maxWidth else { return [] }
+        guard let w = quality.maxWidth else {
+            // Auch ohne Cap (archiveBest) beide Dimensionen auf gerade Werte
+            // truncaten: libx264 mit yuv420p scheitert hart an ungeraden Quell-
+            // massen, und archiveBest hat keinen Hardware-Fallback (Fix H3).
+            // Fuer gerade Quellen reicht scale die Frames unveraendert durch
+            // (Passthrough), es gibt keinen Qualitaetsverlust.
+            return ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+        }
         // Breite auf gerade Zahl abrunden (trunc(.../2)*2), sonst scheitern manche
         // Encoder / yuv420p an ungerader Breite (Fix 5).
         return ["-vf", "scale='trunc(min(\(w),iw)/2)*2':-2:flags=lanczos"]
@@ -359,13 +366,15 @@ actor EncodeService {
 
     // MARK: - Pause / Resume / Cancel
 
-    /// Optional: Encode-Pause ueber SIGSTOP (PLAN.md Abschnitt 8, nice-to-have).
+    /// Encode-Pause ueber SIGSTOP (Fix H8, vom QueueStore.pause() gerufen).
+    /// Der laufende encode()-await haengt dann einfach; das Progress-Lesen
+    /// blockt derweil in availableData. Fortsetzen via resume().
     func pause() {
         guard let pid = currentProcess?.processIdentifier else { return }
         kill(pid, SIGSTOP)
     }
 
-    /// Optional: Encode fortsetzen ueber SIGCONT.
+    /// Encode fortsetzen ueber SIGCONT (Fix H8, vom QueueStore.retry() gerufen).
     func resume() {
         guard let pid = currentProcess?.processIdentifier else { return }
         kill(pid, SIGCONT)

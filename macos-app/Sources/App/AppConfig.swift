@@ -43,11 +43,8 @@ enum AppConfig {
     /// Pydantic-Limit fuer r2-init (presigned, Bytes direkt zu R2): 32 GiB.
     static let r2InitMaxBytes: Int64 = 32 * 1_024 * 1_024 * 1_024
 
-    /// Schwelle, ab der ein presigned-Single-PUT zu Multipart wechselt (4 GiB).
-    static let presignedSinglePutMaxBytes: Int64 = 4 * 1_024 * 1_024 * 1_024
-
-    /// Part-Groesse fuer presigned Multipart (256 MiB), wie in PLAN.md Abschnitt 7.
-    static let multipartPartSize: Int64 = 256 * 1_024 * 1_024
+    // Single-PUT-Schwelle (4 GiB) und Part-Groesse bestimmt der SERVER in der
+    // r2-init-Response (mode/part_size); der Client uebernimmt sie unveraendert.
 
     /// Mindest-Freiplatz auf der Systemplatte vor einem grossen Upload/Encode.
     /// Unter ~10 GB frei haengen R2-Uploads still (Memory feedback_r2_disk_first).

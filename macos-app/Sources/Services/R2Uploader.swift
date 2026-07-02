@@ -113,8 +113,10 @@ struct R2Uploader: Sendable {
         try await withThrowingTaskGroup(of: Void.self) { group in
             var iterator = primary.makeIterator()
             var running = 0
-            // Anfangsfenster fuellen.
+            // Anfangsfenster fuellen. Kooperative Cancellation am Schleifenkopf,
+            // damit remove()/App-Beenden den Upload sofort stoppen kann (Fix H7).
             while running < Self.maxConcurrentPuts, let entry = iterator.next() {
+                try Task.checkCancellation()
                 group.addTask { try await self.putObject(fileURL: entry.fileURL, key: entry.key) }
                 running += 1
             }
@@ -176,14 +178,20 @@ struct R2Uploader: Sendable {
     private func putObject(fileURL: URL, key: String) async throws {
         var attempt = 0
         while true {
+            // Schleifenkopf: Abbruch vor jedem (erneuten) Versuch (Fix H7).
+            // Deckt auch den Fall ab, dass ein abgebrochener URLSession-PUT als
+            // transienter transport-Fehler zurueckkommt und sonst erneut liefe.
+            try Task.checkCancellation()
             attempt += 1
             do {
                 try await putObjectOnce(fileURL: fileURL, key: key)
                 return
             } catch let error as R2UploadError where Self.isTransient(error) && attempt < Self.maxAttempts {
-                // Linearer Backoff: 1.5s, 3.0s, ...
+                // Linearer Backoff: 1.5s, 3.0s, ... Task.sleep wirft bei
+                // Cancellation - der CancellationError wird bewusst propagiert
+                // statt per try? verschluckt (Fix H7).
                 let delaySeconds = Double(attempt) * 1.5
-                try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
                 // naechster Versuch
             }
         }

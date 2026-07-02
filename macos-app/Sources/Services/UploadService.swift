@@ -3,7 +3,9 @@
 // r2-stream als Default ueber URLSession.background(withIdentifier:) mit
 // datei-basiertem uploadTask(with:fromFile:). Delegate liefert Per-Item-Progress
 // (didSendBodyData). Nach Transfer-Abschluss cf-refresh-Polling mit Backoff.
-// presigned-Multipart (r2-init/r2-complete) nur als markierter TODO-Fallback.
+// presigned-Multipart (Dateien ueber dem r2-stream-Cap) laeuft NICHT hier,
+// sondern im MultipartUploader (Vordergrund-Session), orchestriert vom
+// QueueStore (runMultipartUpload).
 // Setzt PLAN.md Abschnitt 7 (Upload-Flows) und Abschnitt 10 (UploadService) um.
 //
 // Hinweis: Auf einem Linux-VPS geschrieben, auf dem Mac noch nicht gebaut.
@@ -45,6 +47,20 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
     private let mapLock = NSLock()
     /// Sammelt pro Task die empfangenen Antwort-Bytes (r2-stream-Antwort ist klein).
     private var responseBuffers: [Int: Data] = [:]
+    /// Item-IDs, fuer die seit App-Start bereits Delegate-Ereignisse (Progress
+    /// oder Abschluss) eingetroffen sind (mapLock-geschuetzt). Grundlage fuer die
+    /// Crash-Recovery: ein im Daemon fertig gewordener Task kann zum Zeitpunkt
+    /// der allTasks-Abfrage schon aus der Session verschwunden sein, obwohl sein
+    /// Abschluss noch auf dem MainActor zur Verarbeitung wartet - solche Items
+    /// duerfen nicht als "verloren" neu hochgeladen werden (Fix H4).
+    private var seenItemIDs: Set<UUID> = []
+
+    /// Merkt, dass fuer diese Item-ID ein Delegate-Ereignis eingetroffen ist (Fix H4).
+    private func markSeen(_ id: UUID) {
+        mapLock.lock()
+        seenItemIDs.insert(id)
+        mapLock.unlock()
+    }
 
     /// Completion-Handler, den AppKit beim Background-Wake uebergibt (Re-Attach).
     var backgroundCompletionHandler: (() -> Void)?
@@ -88,15 +104,22 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
 
     /// Sammelt alle Tasks der Background-Session ein (laufend + abgeschlossen),
     /// damit der QueueStore Items zuordnen kann. Wird beim App-Start gerufen.
+    /// Liefert zusaetzlich alle Items, fuer die bereits Delegate-Ereignisse
+    /// eingetroffen sind: ein fertig gewordener Task faellt aus allTasks heraus,
+    /// sobald seine Events zugestellt wurden - sein Item wird aber vom
+    /// Delegate-Pfad weiterbehandelt und darf in der Crash-Recovery nicht auf
+    /// .encoded zurueckfallen (Duplikat-Version, Fix H4).
     func reattachTasks() async -> [UUID] {
         let tasks = await session.allTasks
-        var ids: [UUID] = []
+        mapLock.lock()
+        var ids = seenItemIDs
+        mapLock.unlock()
         for task in tasks {
             if let desc = task.taskDescription, let id = UUID(uuidString: desc) {
-                ids.append(id)
+                ids.insert(id)
             }
         }
-        return ids
+        return Array(ids)
     }
 
     /// Bricht einen laufenden Background-Upload-Task fuer das gegebene Item ab.
@@ -142,6 +165,7 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         guard totalBytesExpectedToSend > 0,
               let desc = task.taskDescription, let id = UUID(uuidString: desc) else { return }
+        markSeen(id) // Fix H4
         let progress = Double(totalBytesSent) / Double(totalBytesExpectedToSend)
         delegate?.upload(itemID: id, didUpdateProgress: progress)
     }
@@ -154,6 +178,9 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let desc = task.taskDescription, let id = UUID(uuidString: desc) else { return }
+        // Vor der Weitergabe markieren (Fix H4): laeuft die Crash-Recovery
+        // parallel, sieht sie dieses Item als "Event unterwegs" statt "verloren".
+        markSeen(id)
 
         mapLock.lock()
         let body = responseBuffers.removeValue(forKey: task.taskIdentifier) ?? Data()
@@ -193,12 +220,7 @@ final class UploadService: NSObject, URLSessionDataDelegate, @unchecked Sendable
         DispatchQueue.main.async { handler?() }
     }
 
-    // MARK: - TODO(Fallback): presigned Multipart
-
-    /// TODO(Fallback): r2-init -> presigned PUT/Multipart -> r2-complete.
-    /// Nur fuer Dateien ueber ~10 GB (PLAN.md Abschnitt 7). presigned Part-URLs
-    /// haben TTL 12h. In dieser App-Version nicht implementiert.
-    func startMultipartUpload(itemID: UUID, videoID: String, fileURL: URL) throws {
-        throw ApiError.transport("presigned Multipart-Upload ist in dieser App-Version noch nicht implementiert (siehe PLAN.md Abschnitt 7).")
-    }
+    // Hinweis: presigned Multipart (Dateien ueber dem r2-stream-Cap) liegt
+    // bewusst NICHT in diesem Service - siehe Services/MultipartUploader.swift
+    // (Part-PUTs) und QueueStore.runMultipartUpload (Orchestrierung).
 }
